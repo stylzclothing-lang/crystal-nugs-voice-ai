@@ -84,11 +84,7 @@ wss.on("connection", async (twilioWS) => {
     // ---- Twilio -> OpenAI
     twilioWS.on("message", (buf) => {
       let msg;
-      try {
-        msg = JSON.parse(buf.toString());
-      } catch {
-        return;
-      }
+      try { msg = JSON.parse(buf.toString()); } catch { return; }
 
       if (msg.type === "setup") {
         console.log("CR setup:", msg.sessionId, msg.callSid || "");
@@ -99,14 +95,29 @@ wss.on("connection", async (twilioWS) => {
         const userText = (msg.voicePrompt || "").trim();
         console.log("Caller said:", userText);
 
-        // Send text to model and request a response
-        safeSend(openaiWS, { type: "input_text", text: userText });
-        safeSend(openaiWS, { type: "response.create" });
+        // Put the user's message into the conversation
+        safeSend(openaiWS, {
+          type: "conversation.item.create",
+          item: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: userText }]
+          }
+        });
+
+        // Ask the model to respond with text
+        safeSend(openaiWS, {
+          type: "response.create",
+          response: {
+            modalities: ["text"]
+          }
+        });
         return;
       }
 
       if (msg.type === "interrupt") {
         console.log("Caller interrupted playback");
+        // Optional: could abort the current model turn
         return;
       }
 
@@ -120,30 +131,22 @@ wss.on("connection", async (twilioWS) => {
         return;
       }
 
-      if (msg.type) {
-        console.log("CR event:", msg.type);
-      }
+      if (msg.type) console.log("CR event:", msg.type);
     });
 
     twilioWS.on("close", () => {
-      try {
-        openaiWS?.close();
-      } catch {}
+      try { openaiWS?.close(); } catch {}
       console.log("Twilio disconnected");
     });
 
     // ---- OpenAI -> Twilio
     openaiWS.on("message", (raw) => {
       let m;
-      try {
-        m = JSON.parse(raw.toString());
-      } catch {
-        return;
-      }
+      try { m = JSON.parse(raw.toString()); } catch { return; }
 
-      // Log non-token messages for visibility
+      // Log all message types for visibility
       if (m?.type && m.type !== "response.output_text.delta") {
-        console.log("OpenAI msg type:", m.type);
+        console.log("OpenAI msg type:", m.type, m.error ? JSON.stringify(m.error) : "");
       }
 
       if (m.type === "response.output_text.delta" && m.delta) {
@@ -151,7 +154,8 @@ wss.on("connection", async (twilioWS) => {
         safeSend(twilioWS, { type: "text", token: m.delta, last: false });
       }
 
-      if (m.type === "response.completed") {
+      // Some builds emit response.completed, some emit response.done — handle both
+      if (m.type === "response.completed" || m.type === "response.done") {
         safeSend(twilioWS, { type: "text", token: "", last: true });
         console.log("MODEL TURN COMPLETE");
       }
@@ -165,12 +169,8 @@ wss.on("connection", async (twilioWS) => {
     openaiWS.on("error", (e) => console.error("OpenAI WS error:", e?.message || e));
   } catch (err) {
     console.error("Relay init error:", err?.message || err);
-    try {
-      openaiWS?.close();
-    } catch {}
-    try {
-      twilioWS?.close();
-    } catch {}
+    try { openaiWS?.close(); } catch {}
+    try { twilioWS?.close(); } catch {}
   }
 });
 
@@ -195,9 +195,7 @@ function connectOpenAI(model) {
 
 function safeSend(ws, obj) {
   if (!ws || ws.readyState !== ws.OPEN) return;
-  try {
-    ws.send(JSON.stringify(obj));
-  } catch (e) {
+  try { ws.send(JSON.stringify(obj)); } catch (e) {
     console.error("WS send error:", e?.message || e);
   }
 }
