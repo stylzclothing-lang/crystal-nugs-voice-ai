@@ -68,10 +68,11 @@ wss.on("connection", async (twilioWS) => {
   try {
     if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 
+    // 1) Connect to OpenAI Realtime using header flag
     openaiWS = await connectOpenAI(OPENAI_REALTIME_MODEL);
     console.log("OpenAI realtime connected");
 
-    // Initialize session
+    // 2) Session instructions (system prompt)
     safeSend(openaiWS, {
       type: "session.update",
       session: {
@@ -80,9 +81,131 @@ wss.on("connection", async (twilioWS) => {
       }
     });
 
-    // Twilio → OpenAI
+    // ---- Twilio -> OpenAI
     twilioWS.on("message", (buf) => {
       let msg;
-      try { msg = JSON.parse(buf.toString()); } catch { return; }
+      try {
+        msg = JSON.parse(buf.toString());
+      } catch {
+        return;
+      }
 
       if (msg.type === "setup") {
+        console.log("CR setup:", msg.sessionId, msg.callSid || "");
+        return;
+      }
+
+      if (msg.type === "prompt" && msg.voicePrompt) {
+        const userText = (msg.voicePrompt || "").trim();
+        console.log("Caller said:", userText);
+
+        // Send text to model and request a response
+        safeSend(openaiWS, { type: "input_text", text: userText });
+        safeSend(openaiWS, { type: "response.create" });
+        return;
+      }
+
+      if (msg.type === "interrupt") {
+        console.log("Caller interrupted playback");
+        return;
+      }
+
+      if (msg.type === "dtmf") {
+        console.log("DTMF:", msg.digit);
+        return;
+      }
+
+      if (msg.type === "error") {
+        console.error("CR error:", msg.description || msg);
+        return;
+      }
+
+      if (msg.type) {
+        console.log("CR event:", msg.type);
+      }
+    });
+
+    twilioWS.on("close", () => {
+      try {
+        openaiWS?.close();
+      } catch {}
+      console.log("Twilio disconnected");
+    });
+
+    // ---- OpenAI -> Twilio
+    openaiWS.on("message", (raw) => {
+      let m;
+      try {
+        m = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+
+      // Log non-token messages for visibility
+      if (m?.type && m.type !== "response.output_text.delta") {
+        console.log("OpenAI msg type:", m.type);
+      }
+
+      if (m.type === "response.output_text.delta" && m.delta) {
+        // stream tokens back to Twilio; CR does TTS
+        safeSend(twilioWS, { type: "text", token: m.delta, last: false });
+      }
+
+      if (m.type === "response.completed") {
+        safeSend(twilioWS, { type: "text", token: "", last: true });
+        console.log("MODEL TURN COMPLETE");
+      }
+
+      if (m.type === "response.error") {
+        console.error("OpenAI response.error:", m.error || m);
+      }
+    });
+
+    openaiWS.on("close", () => console.log("OpenAI session ended"));
+    openaiWS.on("error", (e) => console.error("OpenAI WS error:", e?.message || e));
+  } catch (err) {
+    console.error("Relay init error:", err?.message || err);
+    try {
+      openaiWS?.close();
+    } catch {}
+    try {
+      twilioWS?.close();
+    } catch {}
+  }
+});
+
+// ---------- Helpers ----------
+function connectOpenAI(model) {
+  return new Promise((resolve, reject) => {
+    const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
+    const ws = new WebSocket(url, {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1"
+      }
+    });
+    ws.on("open", () => resolve(ws));
+    ws.on("error", (e) => reject(e));
+    ws.on("unexpected-response", (req, res) => {
+      console.error("OpenAI unexpected-response:", res.statusCode, res.statusMessage);
+      reject(new Error(`Unexpected response: ${res.statusCode}`));
+    });
+  });
+}
+
+function safeSend(ws, obj) {
+  if (!ws || ws.readyState !== ws.OPEN) return;
+  try {
+    ws.send(JSON.stringify(obj));
+  } catch (e) {
+    console.error("WS send error:", e?.message || e);
+  }
+}
+
+function escapeXml(str = "") {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
