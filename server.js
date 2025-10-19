@@ -1,5 +1,5 @@
 import express from "express";
-import { WebSocketServer } from "ws";
+import { WebSocketServer, WebSocket } from "ws";
 import bodyParser from "body-parser";
 import { config } from "dotenv";
 import twilio from "twilio";
@@ -21,17 +21,15 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 
 // ---- Twilio Voice Webhook ----
 app.post("/twilio/voice", async (req, res) => {
-  const VoiceResponse = twilio.twiml.VoiceResponse;
-  const twiml = new VoiceResponse();
-
   const wsUrl = `wss://${req.get("host")}/relay`;
   const greeting = "Hey! Thanks for calling Crystal Nugs Sacramento. How can I help you today?";
-
-  const connect = twiml.connect();
-  connect.conversationRelay({ url: wsUrl, welcomeGreeting: greeting });
-
-  res.type("text/xml");
-  res.send(twiml.toString());
+  const twiml = `
+    <Response>
+      <Connect>
+        <ConversationRelay url="${wsUrl}" welcomeGreeting="${greeting}"/>
+      </Connect>
+    </Response>`;
+  res.type("text/xml").send(twiml);
 });
 
 // ---- Fallback route ----
@@ -41,6 +39,12 @@ app.post("/twilio/transfer", (req, res) => {
   twiml.dial(process.env.TWILIO_VOICE_FALLBACK || "+19165071099");
   res.type("text/xml");
   res.send(twiml.toString());
+});
+
+// ---- Status Logger (optional helpful route) ----
+app.post("/twilio/status", (req, res) => {
+  console.log("📞 Call status:", req.body?.CallStatus, req.body?.CallSid);
+  res.sendStatus(200);
 });
 
 // ---- WebSocket Relay ----
