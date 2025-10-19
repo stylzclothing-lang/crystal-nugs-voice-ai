@@ -28,7 +28,7 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 app.post("/twilio/voice", (req, res) => {
   const wsUrl = `wss://${req.get("host")}/relay`;
   const greeting =
-    "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, ID rules, or order lookups. What can I do for you?";
+    "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, address, frequently asked questions or delivery order lookups. What can I do for you today?";
   const twiml =
     "<Response>" +
     "<Connect>" +
