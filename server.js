@@ -1,4 +1,4 @@
-// server.js (plain ASCII, CR text protocol)
+// server.js (Twilio Conversation Relay TEXT bridge with OpenAI Realtime)
 
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
@@ -25,17 +25,17 @@ if (!OPENAI_API_KEY) {
 // Health
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// Voice webhook: return TwiML with ConversationRelay to wss://<host>/relay
+// Voice webhook: return TwiML instructing Twilio to connect CR to wss://<host>/relay
 app.post("/twilio/voice", (req, res) => {
   const wsUrl = `wss://${req.get("host")}/relay`;
   const greeting =
     "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, ID rules, or order lookups. What can I do for you?";
   const twiml =
-    `<Response>` +
-    `<Connect>` +
-    `<ConversationRelay url="${wsUrl}" welcomeGreeting="${escapeXml(greeting)}"/>` +
-    `</Connect>` +
-    `</Response>`;
+    "<Response>" +
+      "<Connect>" +
+        `<ConversationRelay url="${wsUrl}" welcomeGreeting="${escapeXml(greeting)}"/>` +
+      "</Connect>" +
+    "</Response>";
   res.type("text/xml").send(twiml);
 });
 
@@ -48,7 +48,7 @@ app.post("/twilio/transfer", (_req, res) => {
   res.type("text/xml").send(twiml.toString());
 });
 
-// Optional: call status logger
+// Optional: call status logger (configure in Twilio "Call status changes")
 app.post("/twilio/status", (req, res) => {
   console.log("Call status:", req.body?.CallStatus, req.body?.CallSid);
   res.sendStatus(200);
@@ -59,7 +59,7 @@ const server = app.listen(PORT, () => {
   console.log("Server listening on port", PORT);
 });
 
-// WebSocket bridge: Twilio CR <-> OpenAI Realtime (TEXT mode)
+// WebSocket bridge: Twilio Conversation Relay <-> OpenAI Realtime (TEXT mode)
 const wss = new WebSocketServer({ server, path: "/relay" });
 
 wss.on("connection", async (twilioWS) => {
@@ -69,10 +69,11 @@ wss.on("connection", async (twilioWS) => {
   try {
     if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 
-    // Connect to OpenAI Realtime
+    // Connect to OpenAI Realtime using the required subprotocol
     openaiWS = await connectOpenAI(OPENAI_REALTIME_MODEL);
+    console.log("OpenAI realtime connected");
 
-    // Prime assistant
+    // Prime the assistant
     safeSend(openaiWS, {
       type: "response.create",
       response: {
@@ -109,7 +110,6 @@ wss.on("connection", async (twilioWS) => {
 
       if (msg.type === "interrupt") {
         console.log("Caller interrupted playback");
-        // Optional: cancel current model response
         return;
       }
 
@@ -131,18 +131,19 @@ wss.on("connection", async (twilioWS) => {
       console.log("Twilio disconnected");
     });
 
-    // OpenAI -> Twilio (stream text tokens)
+    // OpenAI -> Twilio (stream text tokens Twilio will TTS)
     openaiWS.on("message", (raw) => {
       let m;
       try { m = JSON.parse(raw.toString()); } catch { return; }
 
       if (m.type === "response.output_text.delta" && m.delta) {
+        console.log("MODEL TOKEN:", m.delta);
         safeSend(twilioWS, { type: "text", token: m.delta, last: false });
       }
 
       if (m.type === "response.completed") {
+        console.log("MODEL TURN COMPLETE");
         safeSend(twilioWS, { type: "text", token: "", last: true });
-        console.log("Model turn complete");
       }
 
       if (m.type === "response.error") {
@@ -164,10 +165,10 @@ wss.on("connection", async (twilioWS) => {
 function connectOpenAI(model) {
   return new Promise((resolve, reject) => {
     const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
-    const ws = new WebSocket(url, {
+    // Important: specify subprotocol 'openai-realtime-v1'
+    const ws = new WebSocket(url, "openai-realtime-v1", {
       headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1"
+        Authorization: `Bearer ${OPENAI_API_KEY}`
       }
     });
     ws.on("open", () => resolve(ws));
