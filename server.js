@@ -1,10 +1,11 @@
-// server.js — Crystal Nugs Voice AI (Twilio Conversation Relay + OpenAI Realtime, TEXT mode)
+// server.js — Crystal Nugs Voice AI (Twilio Conversation Relay + OpenAI Chat via HTTPS)
 
 import express from "express";
-import { WebSocketServer, WebSocket } from "ws";
+import { WebSocketServer } from "ws";
 import bodyParser from "body-parser";
 import { config } from "dotenv";
 import twilio from "twilio";
+import fetch from "node-fetch";
 
 config();
 
@@ -14,8 +15,8 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_REALTIME_MODEL =
-  process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12";
+const OPENAI_CHAT_MODEL =
+  process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini"; // fast, good quality
 
 if (!OPENAI_API_KEY) {
   console.warn("[WARN] Missing OPENAI_API_KEY in environment");
@@ -24,7 +25,7 @@ if (!OPENAI_API_KEY) {
 // ---------- Health ----------
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// ---------- Voice Webhook ----------
+// ---------- Voice Webhook (TwiML returns ConversationRelay) ----------
 app.post("/twilio/voice", (req, res) => {
   const wsUrl = `wss://${req.get("host")}/relay`;
   const greeting =
@@ -58,141 +59,100 @@ const server = app.listen(PORT, () => {
   console.log("Server listening on port", PORT);
 });
 
-// ---------- WebSocket bridge: Twilio CR <-> OpenAI Realtime (TEXT) ----------
+// ---------- WebSocket bridge: Twilio CR <-> (HTTPS) OpenAI Chat ----------
 const wss = new WebSocketServer({ server, path: "/relay" });
 
 wss.on("connection", async (twilioWS) => {
-  console.log("Twilio connected to Conversation Relay (TEXT mode)");
-  let openaiWS;
+  console.log("Twilio connected to Conversation Relay (HTTPS Chat mode)");
 
-  try {
-    if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+  twilioWS.on("message", async (buf) => {
+    let msg;
+    try { msg = JSON.parse(buf.toString()); } catch { return; }
 
-    // 1) Connect to OpenAI Realtime using header flag
-    openaiWS = await connectOpenAI(OPENAI_REALTIME_MODEL);
-    console.log("OpenAI realtime connected");
+    if (msg.type === "setup") {
+      console.log("CR setup:", msg.sessionId, msg.callSid || "");
+      return;
+    }
 
-    // 2) Session instructions (system prompt)
-    safeSend(openaiWS, {
-      type: "session.update",
-      session: {
-        instructions:
-          "You are the Crystal Nugs Sacramento voice assistant. Be concise, friendly, and accurate. Store hours are 9am-9pm daily. ID rules: valid government ID, must be 21+. Delivery zones: Midtown and greater Sacramento. Avoid medical claims and payments by phone. If the caller asks to speak to a person, say 'No problem — transferring you now' and stop."
-      }
-    });
+    if (msg.type === "prompt" && msg.voicePrompt) {
+      const userText = (msg.voicePrompt || "").trim();
+      console.log("Caller said:", userText);
 
-    // ---- Twilio -> OpenAI
-    twilioWS.on("message", (buf) => {
-      let msg;
-      try { msg = JSON.parse(buf.toString()); } catch { return; }
-
-      if (msg.type === "setup") {
-        console.log("CR setup:", msg.sessionId, msg.callSid || "");
-        return;
-      }
-
-      if (msg.type === "prompt" && msg.voicePrompt) {
-        const userText = (msg.voicePrompt || "").trim();
-        console.log("Caller said:", userText);
-
-        // Put the user's message into the conversation
-        safeSend(openaiWS, {
-          type: "conversation.item.create",
-          item: {
-            type: "message",
-            role: "user",
-            content: [{ type: "input_text", text: userText }]
-          }
+      try {
+        const answer = await askOpenAI(userText);
+        // Send a single text message back; CR will TTS it.
+        safeSend(twilioWS, { type: "text", token: answer, last: true });
+        console.log("Replied with", Math.min(answer.length, 80), "chars");
+      } catch (e) {
+        console.error("OpenAI HTTPS error:", e?.message || e);
+        safeSend(twilioWS, {
+          type: "text",
+          token: "Sorry, I’m having trouble right now.",
+          last: true
         });
-
-        // Ask the model to respond with text
-        safeSend(openaiWS, {
-          type: "response.create",
-          response: {
-            modalities: ["text"]
-          }
-        });
-        return;
       }
+      return;
+    }
 
-      if (msg.type === "interrupt") {
-        console.log("Caller interrupted playback");
-        // Optional: could abort the current model turn
-        return;
-      }
+    if (msg.type === "interrupt") {
+      console.log("Caller interrupted playback");
+      return;
+    }
 
-      if (msg.type === "dtmf") {
-        console.log("DTMF:", msg.digit);
-        return;
-      }
+    if (msg.type === "dtmf") {
+      console.log("DTMF:", msg.digit);
+      return;
+    }
 
-      if (msg.type === "error") {
-        console.error("CR error:", msg.description || msg);
-        return;
-      }
+    if (msg.type === "error") {
+      console.error("CR error:", msg.description || msg);
+      return;
+    }
 
-      if (msg.type) console.log("CR event:", msg.type);
-    });
+    if (msg.type) console.log("CR event:", msg.type);
+  });
 
-    twilioWS.on("close", () => {
-      try { openaiWS?.close(); } catch {}
-      console.log("Twilio disconnected");
-    });
-
-    // ---- OpenAI -> Twilio
-    openaiWS.on("message", (raw) => {
-      let m;
-      try { m = JSON.parse(raw.toString()); } catch { return; }
-
-      // Log all message types for visibility
-      if (m?.type && m.type !== "response.output_text.delta") {
-        console.log("OpenAI msg type:", m.type, m.error ? JSON.stringify(m.error) : "");
-      }
-
-      if (m.type === "response.output_text.delta" && m.delta) {
-        // stream tokens back to Twilio; CR does TTS
-        safeSend(twilioWS, { type: "text", token: m.delta, last: false });
-      }
-
-      // Some builds emit response.completed, some emit response.done — handle both
-      if (m.type === "response.completed" || m.type === "response.done") {
-        safeSend(twilioWS, { type: "text", token: "", last: true });
-        console.log("MODEL TURN COMPLETE");
-      }
-
-      if (m.type === "response.error") {
-        console.error("OpenAI response.error:", m.error || m);
-      }
-    });
-
-    openaiWS.on("close", () => console.log("OpenAI session ended"));
-    openaiWS.on("error", (e) => console.error("OpenAI WS error:", e?.message || e));
-  } catch (err) {
-    console.error("Relay init error:", err?.message || err);
-    try { openaiWS?.close(); } catch {}
-    try { twilioWS?.close(); } catch {}
-  }
+  twilioWS.on("close", () => {
+    console.log("Twilio disconnected");
+  });
 });
 
-// ---------- Helpers ----------
-function connectOpenAI(model) {
-  return new Promise((resolve, reject) => {
-    const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
-    const ws = new WebSocket(url, {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1"
-      }
-    });
-    ws.on("open", () => resolve(ws));
-    ws.on("error", (e) => reject(e));
-    ws.on("unexpected-response", (req, res) => {
-      console.error("OpenAI unexpected-response:", res.statusCode, res.statusMessage);
-      reject(new Error(`Unexpected response: ${res.statusCode}`));
-    });
+// ---------- OpenAI HTTPS helper ----------
+const SYSTEM_PROMPT =
+  "You are the Crystal Nugs Sacramento voice assistant. Be concise, friendly, and accurate. Store hours are 9am-9pm daily. ID rules: valid government ID, must be 21+. Delivery zones: Midtown and greater Sacramento. Avoid medical claims and payments by phone. If the caller asks to speak to a person, say 'No problem — transferring you now' and stop.";
+
+async function askOpenAI(userText) {
+  // Use Chat Completions–style schema for compatibility
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: OPENAI_CHAT_MODEL,
+      temperature: 0.4,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: userText }
+      ]
+    })
   });
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`OpenAI HTTP ${resp.status}: ${text}`);
+  }
+
+  const data = await resp.json();
+  const content =
+    data?.choices?.[0]?.message?.content?.trim?.() ||
+    data?.choices?.[0]?.message?.content ||
+    "";
+  return content || "Sorry, I didn’t catch that.";
 }
 
+// ---------- Utils ----------
 function safeSend(ws, obj) {
   if (!ws || ws.readyState !== ws.OPEN) return;
   try { ws.send(JSON.stringify(obj)); } catch (e) {
