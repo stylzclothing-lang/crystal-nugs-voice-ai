@@ -142,46 +142,85 @@ wss.on("connection", async (twilioWS) => {
 });
 
 // ---------- Local Intent Handler ----------
-function handleLocalIntent(text) {
-  const q = (text || "").toLowerCase();
+// ---------- Local Intent Router (uses your Render env vars) ----------
+function handleLocalIntent(text = "") {
+  const q = text.toLowerCase();
 
-  // Hours
-  if (/\bhours?\b|\bopen\b|\bclose\b|\bopening\b|\bclosing\b/.test(q)) {
-    return `${CN_HOURS} Anything else I can help with?`;
+  // Helper: build answers from env, with sensible fallbacks
+  const HOURS       = process.env.CN_HOURS       || "Our dispensary is open daily from 9:00 AM to 9:00 PM, and we take delivery orders from 8:30 AM to 8:30 PM.";
+  const ADDRESS     = process.env.CN_ADDRESS     || "2300 J Street, Sacramento, CA 95816";
+  const ID_RULES    = process.env.CN_ID_RULES    || "You’ll need a valid government-issued photo ID and be at least 21+.";
+  const DELIVERY    = process.env.CN_DELIVERY    || "We deliver to Midtown and the greater Sacramento area including Citrus Heights, Roseville, Lincoln, Folsom, Elk Grove, and more. Share your address to confirm delivery.";
+  const DELIV_MIN   = process.env.CN_DELIVERY_MINIMUM || "Order minimums depend on where you’re located — for the immediate Sacramento area, it’s just $40.";
+  const DELIV_FEE   = process.env.CN_DELIVERY_FEE     || "Enjoy fast delivery for just $1.99 on most orders.";
+  const LAST_CALL   = process.env.CN_LAST_CALL        || "Last call for delivery is 8:15 PM daily. Orders placed after that time, or from distant locations, may be scheduled for the next day — so get your orders in early!";
+  const MED_PTS     = process.env.CN_MED_PATIENTS     || "We also accept verified medical patients ages 18+ with a valid recommendation.";
+  const PARKING     = process.env.CN_PARKING          || "Plenty of street parking available right on J Street and 23rd — easy access to the shop!";
+  const PAYMENT     = process.env.CN_PAYMENT          || "We accept cash and JanePay for both in-store and delivery orders. And if you need cash, no worries — we’ve got two ATMs right inside the dispensary.";
+  const SPECIALS    = process.env.CN_SPECIALS         || "To check out today’s deals, just visit crystalnugs.com — our daily specials will appear automatically. Deals change every single day, so don’t miss out!";
+  const RETURNS     = process.env.CN_RETURN_POLICY    || "In accordance with California DCC regulations, Crystal Nugs may exchange most defective products within 24 hours of purchase when returned in their original packaging and accompanied by a valid receipt. Exchanges are limited to products verified as defective and purchased directly from our dispensary. For more details on eligible items and procedures, please visit the FAQ section on our website.";
+  const VENDOR_INFO = process.env.CN_VENDOR_INFO      || "Vendors and brands looking to collaborate with Crystal Nugs can email chris@crystalnugs.com with your catalog, absolute best pricing structure, and what sets your brand apart. Our purchasing team reviews all submissions weekly and will reach out directly if your products are a fit for our dispensary lineup.";
+  const VENDOR_DEMO = process.env.CN_VENDOR_DEMO      || "If you’d like to schedule an in-store demo or brand activation at Crystal Nugs, please email our demo coordinator at gummiegrannie72@gmail.com with your preferred dates, time slots, and sample information. Our events team will confirm availability and handle compliance details.";
+  const WEBSITE     = process.env.CN_WEBSITE          || "https://www.crystalnugs.com";
+  const MAP_URL     = process.env.CN_DIRECTIONS_URL   || "https://maps.google.com/?q=2300+J+Street,+Sacramento,+CA+95816";
+
+  // 🕒 Hours
+  if (/\bhour|open|close|when\b/.test(q)) {
+    const add = LAST_CALL ? ` ${LAST_CALL}` : "";
+    return `${HOURS}${add} Anything else I can help with?`;
   }
 
-  // Address / location
-  if (/\baddress\b|\blocation\b|\bwhere (are|r) (you|u)\b|\bstore\b/.test(q)) {
-    return `Our address is ${CN_ADDRESS}. Would you like directions?`;
+  // 📍 Address / directions
+  if (/\baddress|location|where|directions|how to get\b/.test(q)) {
+    const add = MAP_URL ? ` For directions, you can use this link: ${MAP_URL}` : "";
+    return `We’re located at ${ADDRESS}.${add}`;
   }
 
-  // ID / age rules
-  if (/\bid\b|\bage\b|\b21\b|\bidentification\b/.test(q)) {
-    return `${CN_ID_RULES} Do you want help finding something specific today?`;
+  // 🪪 ID rules / age
+  if (/\bid|identification|age|21\b/.test(q)) {
+    const med = MED_PTS ? ` ${MED_PTS}` : "";
+    return `${ID_RULES}${med}`;
   }
 
-  // Delivery zones / areas / ETA
-  if (/\bdeliver(y|ies)?\b|\bzone(s)?\b|\barea(s)?\b|\bhow far\b|\bdeliver to\b/.test(q)) {
-    return `${CN_DELIVERY} Want me to check if your address is in range?`;
+  // 🚗 Delivery areas / fees / minimums / last call
+  if (/\bdeliver|delivery|zone|area|radius|how far|minimum|fee|charge\b/.test(q)) {
+    const min = DELIV_MIN ? ` ${DELIV_MIN}.` : "";
+    const fee = DELIV_FEE ? ` ${DELIV_FEE}` : "";
+    const last = LAST_CALL ? ` ${LAST_CALL}` : "";
+    return `${DELIVERY}${min}${fee}${last ? " " + last : ""} Share your address to confirm coverage.`;
   }
 
- // Payments
- if (/\b(pay|payment|payments|cash|debit|card|janepay|jane pay|atm|atms)\b/.test(q)) {
-  return `${CN_PAYMENT} Anything else I can help with?`;
-}
-
- // Deals / specials / loyalty
- if (/\b(deal|deals|special|specials|discount|discounts|promo|promos|loyalty|rewards)\b/.test(q)) {
-  return `${CN_SPECIALS} Want me to text you the link?`;
-}
-
-  // Human transfer
-  if (/\b(human|agent|person|representative|budtender|staff|someone)\b|\btransfer\b|\btalk to\b/.test(q)) {
-    return `No problem — transferring you now.`;
+  // 🅿️ Parking
+  if (/\bparking|park\b/.test(q)) {
+    return PARKING || "Street parking is available nearby.";
   }
 
-  // Unknown: let model handle
-  return null;
+  // 💳 Payments / ATM / JanePay
+  if (/\bpay|payment|cash|card|debit|atm|jane ?pay\b/.test(q)) {
+    return `${PAYMENT} Anything else I can help with?`;
+  }
+
+  // 💥 Specials / deals / promos
+  if (/\bdeal|special|discount|offer|promotion|promo|promos\b/.test(q)) {
+    return `${SPECIALS} Would you like any help finding something specific?`;
+  }
+
+  // 🔁 Returns / exchanges / defective
+  if (/\breturn|exchange|refund|defective|replace|swap\b/.test(q)) {
+    return RETURNS;
+  }
+
+  // 🏢 Vendor / brand inquiries
+  if (/\bvendor|brand|wholesale|distributor|carry my product|buyer\b/.test(q)) {
+    return VENDOR_INFO;
+  }
+
+  // 🎤 Demo scheduling
+  if (/\bdemo|activation|in-?store|pop-?up|brand day|sampling|event\b/.test(q)) {
+    return VENDOR_DEMO;
+  }
+
+  return null; // let OpenAI handle anything else
 }
 
 // ---------- OpenAI HTTPS helper ----------
