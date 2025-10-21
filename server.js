@@ -255,7 +255,6 @@ Returns: ${RETURNS}
 
 // ---------- Utils ----------
 function safeSend(ws, obj) {
-  // Correct: compare against WebSocket class constant
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   try {
     ws.send(JSON.stringify(obj));
@@ -298,7 +297,8 @@ function toSpokenText(text = "") {
  * Brand voice preset:
  * - Always sanitize via toSpokenText()
  * - Plain text mode: concise sentences and em dashes for micro-pauses.
- * - SSML mode (CN_USE_SSML=true): adds <break> and stable prosody.
+ * - SSML mode (CN_USE_SSML=true): energetic + smart delivery:
+ *   medium-fast rate, +6% pitch, 240ms breaks, light emphasis on lead words.
  */
 function brandVoice(raw = "") {
   const cleaned = toSpokenText(raw).trim();
@@ -313,16 +313,37 @@ function brandVoice(raw = "") {
       .replace(/\s{2,}/g, " ");
   }
 
+  // Split into sentence-like chunks for natural phrasing
   const parts = cleaned
     .split(/(?<=[\.\?!])\s+/)
     .map((s) => s.trim())
     .filter(Boolean);
 
-  const ssmlBody = parts.map((s) => escapeSSML(s)).join('<break time="200ms"/>');
-  return `<speak><prosody rate="medium" pitch="+10%">` + ssmlBody + `</prosody></speak>`;
+  const ssmlBody = parts
+    .map((s) => emphasisLead(s, 3)) // emphasize first ~3 words for a lively start
+    .join('<break time="240ms"/>');
+
+  return `<speak>
+    <prosody rate="medium-fast" pitch="+6%" volume="medium">
+      ${ssmlBody}
+    </prosody>
+  </speak>`;
+}
+
+// Emphasize the first N words lightly; escape both lead and tail safely
+function emphasisLead(sentence = "", n = 3) {
+  const tokens = sentence.split(/\s+/).filter(Boolean);
+  const lead = tokens.slice(0, n).join(" ");
+  const tail = tokens.slice(n).join(" ");
+  const leadEsc = escapeSSML(lead);
+  const tailEsc = escapeSSML(tail);
+  return tail
+    ? `<emphasis level="moderate">${leadEsc}</emphasis> ${tailEsc}`
+    : `<emphasis level="moderate">${leadEsc}</emphasis>`;
 }
 
 function escapeSSML(str = "") {
+  // Minimal safe escaping for text nodes inside SSML
   return String(str)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
