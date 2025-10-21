@@ -324,7 +324,7 @@ function brandVoice(raw = "") {
     .join('<break time="240ms"/>');
 
   return `<speak>
-    <prosody rate="fast" pitch="+10%" volume="medium">
+    <prosody rate="fast" pitch="+8%" volume="medium">
       ${ssmlBody}
     </prosody>
   </speak>`;
