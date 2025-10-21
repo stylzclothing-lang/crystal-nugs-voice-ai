@@ -1,4 +1,4 @@
-// server.js — Crystal Nugs Voice AI (Concierge Voice + URL/Email Sanitizer)
+// server.js — Crystal Nugs Voice AI (Luxury Concierge Female: Google en-US-Wavenet-F)
 // Twilio Conversation Relay (TEXT) + Local Intents + OpenAI fallback
 
 import express from "express";
@@ -91,11 +91,15 @@ app.post("/twilio/voice", (req, res) => {
     "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?";
 
   const twiml =
-    "<Response>" +
-      "<Connect>" +
-        `<ConversationRelay url="${wsUrl}" welcomeGreeting="${escapeXml(greeting)}"/>` +
-      "</Connect>" +
-    "</Response>";
+    `<Response>
+       <Connect>
+         <ConversationRelay
+           url="${wsUrl}"
+           ttsProvider="Google"
+           voice="en-US-Wavenet-F"
+           welcomeGreeting="${escapeXml(greeting)}" />
+       </Connect>
+     </Response>`;
 
   res.type("text/xml").send(twiml);
 });
@@ -194,7 +198,7 @@ function handleLocalIntent(q = "") {
 async function askOpenAI(userText) {
   const systemPrompt = `
 You are the Crystal Nugs Sacramento AI voice assistant.
-Speak in a warm, concierge tone. Keep sentences short. Use natural pauses.
+Speak in a warm, luxury-concierge tone. Keep sentences short. Use natural pauses.
 Never read raw URLs. Say "Crystal Nugs dot com" instead of a link.
 If asked for a person, say “No problem, transferring you now.”
 Store hours: ${HOURS}
