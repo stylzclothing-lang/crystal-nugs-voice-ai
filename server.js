@@ -1,4 +1,4 @@
-// server.js — Crystal Nugs Voice AI (Amazon Polly Joanna + URL/Email Sanitizer)
+// server.js — Crystal Nugs Voice AI (Amazon Polly Joanna) + Logging + URL/Email Sanitizer
 // Twilio Conversation Relay (TEXT) + Local Intents + OpenAI fallback
 
 import express from "express";
@@ -84,6 +84,14 @@ const MAP_URL =
 // ---------- Health ----------
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
+// (Optional) Quick route to eyeball TwiML in a browser
+app.get("/twiml", (req, res) => {
+  const wsUrl = `wss://${req.get("host")}/relay`;
+  const greeting = "Hello from Crystal Nugs test.";
+  const twiml = `<Response><Connect><ConversationRelay url="${wsUrl}" ttsProvider="Amazon" voice="Joanna" welcomeGreeting="${escapeXml(greeting)}"/></Connect></Response>`;
+  res.type("text/xml").send(twiml);
+});
+
 // ---------- Voice Webhook ----------
 app.post("/twilio/voice", (req, res) => {
   const wsUrl = `wss://${req.get("host")}/relay`;
@@ -102,6 +110,7 @@ app.post("/twilio/voice", (req, res) => {
        </Connect>
      </Response>`;
 
+  console.log("Serving /twilio/voice TwiML:\n", twiml);
   res.type("text/xml").send(twiml);
 });
 
@@ -124,8 +133,17 @@ const server = app.listen(PORT, () => {
   console.log("Server listening on port", PORT);
 });
 
+server.on("upgrade", (req) => {
+  // Helps confirm Twilio is attempting a WS upgrade
+  console.log("HTTP upgrade (WS) ->", req.url);
+});
+
 // ---------- WebSocket Bridge ----------
 const wss = new WebSocketServer({ server, path: "/relay" });
+
+wss.on("error", (err) => {
+  console.error("WSS server error:", err?.message || err);
+});
 
 wss.on("connection", async (twilioWS) => {
   console.log("Twilio connected to Conversation Relay (HTTPS Chat + local intents)");
@@ -176,7 +194,13 @@ wss.on("connection", async (twilioWS) => {
     }
   });
 
-  twilioWS.on("close", () => console.log("Twilio disconnected"));
+  twilioWS.on("error", (err) => {
+    console.error("Twilio WS error:", err?.message || err);
+  });
+
+  twilioWS.on("close", (code, reason) => {
+    console.log("Twilio WS closed:", code, reason?.toString());
+  });
 });
 
 // ---------- Local Intent Handler ----------
