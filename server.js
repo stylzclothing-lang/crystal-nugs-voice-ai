@@ -1,4 +1,4 @@
-// server.js — Crystal Nugs Voice AI (Luxury Concierge Female: Google en-US-Wavenet-F)
+// server.js — Crystal Nugs Voice AI (Amazon Polly Joanna + URL/Email Sanitizer)
 // Twilio Conversation Relay (TEXT) + Local Intents + OpenAI fallback
 
 import express from "express";
@@ -90,13 +90,14 @@ app.post("/twilio/voice", (req, res) => {
   const greeting =
     "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?";
 
+  // Amazon Polly (balanced, clear female): Joanna
   const twiml =
     `<Response>
        <Connect>
          <ConversationRelay
            url="${wsUrl}"
-           ttsProvider="Google"
-           voice="en-US-Wavenet-F"
+           ttsProvider="Amazon"
+           voice="Joanna"
            welcomeGreeting="${escapeXml(greeting)}" />
        </Connect>
      </Response>`;
@@ -198,7 +199,7 @@ function handleLocalIntent(q = "") {
 async function askOpenAI(userText) {
   const systemPrompt = `
 You are the Crystal Nugs Sacramento AI voice assistant.
-Speak in a warm, luxury-concierge tone. Keep sentences short. Use natural pauses.
+Speak in a warm, concierge tone. Keep sentences short. Use natural pauses.
 Never read raw URLs. Say "Crystal Nugs dot com" instead of a link.
 If asked for a person, say “No problem, transferring you now.”
 Store hours: ${HOURS}
@@ -274,7 +275,7 @@ function toSpokenText(text = "") {
  * Brand voice preset:
  * - Always sanitize via toSpokenText()
  * - Plain text mode: concise sentences and em dashes for micro-pauses.
- * - SSML mode (CN_USE_SSML=true): adds <break> and stable prosody.
+ * - SSML mode (CN_USE_SSML=true): adds <break> and stable prosody (Polly supports SSML).
  */
 function brandVoice(raw = "") {
   const cleaned = toSpokenText(raw).trim();
