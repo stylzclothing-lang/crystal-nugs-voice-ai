@@ -1,8 +1,8 @@
-// server.js — Crystal Nugs Voice AI (Amazon Polly Joanna) + Logging + URL/Email Sanitizer
+// server.js — Crystal Nugs Voice AI (Amazon Polly Joanna) — Fixed WS + Hardened OpenAI + Sanitizer
 // Twilio Conversation Relay (TEXT) + Local Intents + OpenAI fallback
 
 import express from "express";
-import { WebSocketServer } from "ws";
+import { WebSocketServer, WebSocket } from "ws";
 import bodyParser from "body-parser";
 import { config } from "dotenv";
 import twilio from "twilio";
@@ -251,13 +251,21 @@ Returns: ${RETURNS}
     }),
   });
 
-  const data = await resp.json();
-  return data?.choices?.[0]?.message?.content || "Sorry, I didn’t catch that.";
+  // Hardened error handling
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => "");
+    throw new Error(`OpenAI ${resp.status} ${resp.statusText}: ${errText.slice(0, 500)}`);
+  }
+
+  const data = await resp.json().catch(() => null);
+  const answer = data?.choices?.[0]?.message?.content?.trim();
+  return answer || "Sorry, I didn’t catch that.";
 }
 
 // ---------- Utils ----------
 function safeSend(ws, obj) {
-  if (!ws || ws.readyState !== ws.OPEN) return;
+  // FIX: check class constant, not instance
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
   try {
     ws.send(JSON.stringify(obj));
   } catch (e) {
