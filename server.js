@@ -1,4 +1,4 @@
-// server.js — Crystal Nugs Voice AI (Amazon Polly Joanna) — Fixed WS + Hardened OpenAI + Sanitizer
+// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F) — Fixed WS + Hardened OpenAI + Sanitizer
 // Twilio Conversation Relay (TEXT) + Local Intents + OpenAI fallback
 
 import express from "express";
@@ -84,28 +84,20 @@ const MAP_URL =
 // ---------- Health ----------
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// (Optional) Quick route to eyeball TwiML in a browser
-app.get("/twiml", (req, res) => {
-  const wsUrl = `wss://${req.get("host")}/relay`;
-  const greeting = "Hello from Crystal Nugs test.";
-  const twiml = `<Response><Connect><ConversationRelay url="${wsUrl}" ttsProvider="Amazon" voice="Joanna" welcomeGreeting="${escapeXml(greeting)}"/></Connect></Response>`;
-  res.type("text/xml").send(twiml);
-});
-
 // ---------- Voice Webhook ----------
 app.post("/twilio/voice", (req, res) => {
   const wsUrl = `wss://${req.get("host")}/relay`;
   const greeting =
     "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?";
 
-  // Amazon Polly (balanced, clear female): Joanna
+  // Google Wavenet (luxury concierge female)
   const twiml =
     `<Response>
        <Connect>
          <ConversationRelay
            url="${wsUrl}"
-           ttsProvider="Amazon"
-           voice="Joanna"
+           ttsProvider="Google"
+           voice="en-US-Wavenet-F"
            welcomeGreeting="${escapeXml(greeting)}" />
        </Connect>
      </Response>`;
@@ -251,7 +243,6 @@ Returns: ${RETURNS}
     }),
   });
 
-  // Hardened error handling
   if (!resp.ok) {
     const errText = await resp.text().catch(() => "");
     throw new Error(`OpenAI ${resp.status} ${resp.statusText}: ${errText.slice(0, 500)}`);
@@ -264,7 +255,7 @@ Returns: ${RETURNS}
 
 // ---------- Utils ----------
 function safeSend(ws, obj) {
-  // FIX: check class constant, not instance
+  // Correct: compare against WebSocket class constant
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   try {
     ws.send(JSON.stringify(obj));
@@ -307,13 +298,12 @@ function toSpokenText(text = "") {
  * Brand voice preset:
  * - Always sanitize via toSpokenText()
  * - Plain text mode: concise sentences and em dashes for micro-pauses.
- * - SSML mode (CN_USE_SSML=true): adds <break> and stable prosody (Polly supports SSML).
+ * - SSML mode (CN_USE_SSML=true): adds <break> and stable prosody.
  */
 function brandVoice(raw = "") {
   const cleaned = toSpokenText(raw).trim();
 
   if (!USE_SSML) {
-    // Plain text shaping to sound natural on most TTS engines.
     return cleaned
       .replace(/\s+/g, " ")
       .replace(/\s-\s/g, " — ")
@@ -323,15 +313,13 @@ function brandVoice(raw = "") {
       .replace(/\s{2,}/g, " ");
   }
 
-  // SSML mode: gentle pacing between sentences.
   const parts = cleaned
     .split(/(?<=[\.\?!])\s+/)
     .map((s) => s.trim())
     .filter(Boolean);
 
   const ssmlBody = parts.map((s) => escapeSSML(s)).join('<break time="200ms"/>');
-
-  return `<speak><prosody rate="medium" pitch="+0%">` + ssmlBody + `</prosody></speak>`;
+  return `<speak><prosody rate="medium" pitch="+10%">` + ssmlBody + `</prosody></speak>`;
 }
 
 function escapeSSML(str = "") {
