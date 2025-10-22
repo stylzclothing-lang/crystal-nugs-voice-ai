@@ -1,8 +1,8 @@
-// server.js — Crystal Nugs Voice AI (CommonJS build for Render)
+// server.js — Crystal Nugs Voice AI (CommonJS, local JSON only)
 // - TwiML with <ConversationRelay ... welcomeGreeting="...">
-// - WS: auto-negotiates outbound payload schema to avoid 64107
-// - Loads zips from ./data/zipzones.json or CN_ZIP_DATA_URL
-// - Answers ZIP min/fee/time; plus hours/address/phone/site; fallback
+// - WS auto-negotiates outbound message shape to avoid 64107 (Invalid message)
+// - Loads ZIP data ONLY from local file CN_ZIP_DATA_PATH (no remote fetch)
+// - Answers ZIP min/fee/time + hours/address/phone/website + fallback
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -10,13 +10,6 @@ require("dotenv").config();
 const { WebSocketServer } = require("ws");
 const fs = require("fs/promises");
 const path = require("path");
-
-// Optional fetch for remote data (Node >=18 has global fetch)
-async function getFetch() {
-  if (typeof fetch === "function") return fetch;
-  const mod = await import("node-fetch");
-  return mod.default;
-}
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -39,9 +32,7 @@ const WELCOME_GREETING =
   'Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?';
 
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
-
 const CN_ZIP_DATA_PATH = process.env.CN_ZIP_DATA_PATH || "./data/zipzones.json";
-const CN_ZIP_DATA_URL = process.env.CN_ZIP_DATA_URL || "";
 
 // Non-zip quick answers (use your existing envs if set)
 const CN_HOURS = process.env.CN_HOURS || "We’re open daily; last call is ~90 minutes before close.";
@@ -54,19 +45,7 @@ const CN_WEBSITE = process.env.CN_WEBSITE || "crystalnugs.com";
 ========================= */
 let ZIP_TABLE = new Map(); // zip -> { min, fee, lead, lastCall }
 
-function parseCsv(raw) {
-  const lines = raw.split(/\r?\n/).filter((l) => l.trim().length);
-  if (!lines.length) return [];
-  const header = lines[0].split(",").map((h) => h.trim().toLowerCase());
-  return lines.slice(1).map((line) => {
-    const cols = line.split(",").map((c) => c.trim());
-    const obj = {};
-    header.forEach((h, i) => (obj[h] = cols[i]));
-    return obj;
-  });
-}
-
-function normHeaders(row) {
+function normalizeRow(row) {
   const nk = (k) => (k || "").toLowerCase().replace(/\s+/g, "_");
   const o = {};
   Object.entries(row || {}).forEach(([k, v]) => (o[nk(k)] = v));
@@ -79,15 +58,25 @@ function normHeaders(row) {
   return { zipcode, min, fee, lead, lastCall: last };
 }
 
-function parseZipTable(raw, ext) {
-  const map = new Map();
-  if (ext === ".json") {
+async function bootZipTable() {
+  try {
+    const abs = path.resolve(process.cwd(), CN_ZIP_DATA_PATH);
+    const raw = await fs.readFile(abs, "utf8");
+
+    const ext = path.extname(abs).toLowerCase() || ".json";
+    const map = new Map();
+
+    if (ext !== ".json") {
+      throw new Error(`Only .json supported in this build. Got: ${ext}`);
+    }
+
     const data = JSON.parse(raw);
     const rows = Array.isArray(data)
       ? data
       : Object.entries(data).map(([zipcode, v]) => ({ zipcode, ...v }));
+
     for (const r of rows) {
-      const { zipcode, min, fee, lead, lastCall } = normHeaders(r);
+      const { zipcode, min, fee, lead, lastCall } = normalizeRow(r);
       const z = String(zipcode || "").replace(/\D/g, "");
       if (!/^\d{5}$/.test(z)) continue;
       const m = parseFloat(min);
@@ -97,50 +86,9 @@ function parseZipTable(raw, ext) {
       if (!Number.isFinite(m) || !Number.isFinite(f)) continue;
       map.set(z, { min: m, fee: f, lead: ld, lastCall: lc });
     }
-  } else if (ext === ".csv") {
-    const rows = parseCsv(raw);
-    for (const r of rows) {
-      const { zipcode, min, fee, lead, lastCall } = normHeaders(r);
-      const z = String(zipcode || "").replace(/\D/g, "");
-      if (!/^\d{5}$/.test(z)) continue;
-      const m = parseFloat(min);
-      const f = parseFloat(fee);
-      const ld = lead != null ? parseFloat(lead) : null;
-      const lc = lastCall != null ? parseFloat(lastCall) : null;
-      if (!Number.isFinite(m) || !Number.isFinite(f)) continue;
-      map.set(z, { min: m, fee: f, lead: ld, lastCall: lc });
-    }
-  } else {
-    throw new Error(`Unsupported data extension: ${ext} (use .json or .csv)`);
-  }
-  return map;
-}
 
-async function loadZipTableFromFile(filePath) {
-  const abs = path.resolve(process.cwd(), filePath);
-  const raw = await fs.readFile(abs, "utf8");
-  const ext = path.extname(abs).toLowerCase() || ".json";
-  return parseZipTable(raw, ext);
-}
-
-async function loadZipTableFromUrl(url) {
-  const $fetch = await getFetch();
-  const r = await $fetch(url);
-  if (!r.ok) throw new Error(`Fetch failed ${r.status}`);
-  const raw = await r.text();
-  const ext = url.toLowerCase().includes(".csv") ? ".csv" : ".json";
-  return parseZipTable(raw, ext);
-}
-
-async function bootZipTable() {
-  try {
-    if (CN_ZIP_DATA_URL) {
-      ZIP_TABLE = await loadZipTableFromUrl(CN_ZIP_DATA_URL);
-      console.log(`ZIP table loaded from URL: ${CN_ZIP_DATA_URL} — rows: ${ZIP_TABLE.size}`);
-    } else {
-      ZIP_TABLE = await loadZipTableFromFile(CN_ZIP_DATA_PATH);
-      console.log(`ZIP table loaded from file: ${CN_ZIP_DATA_PATH} — rows: ${ZIP_TABLE.size}`);
-    }
+    ZIP_TABLE = map;
+    console.log(`ZIP table loaded from file: ${CN_ZIP_DATA_PATH} — rows: ${ZIP_TABLE.size}`);
   } catch (e) {
     console.error("Failed to load ZIP table:", e.message);
     ZIP_TABLE = new Map();
@@ -247,17 +195,13 @@ app.post("/admin/reload-zips", async (req, res) => {
    HEALTH
 ========================= */
 app.get("/health", (req, res) =>
-  res.json({
-    ok: true,
-    relay: WS_RELAY_PUBLIC_URL || null,
-    rows: ZIP_TABLE.size,
-  })
+  res.json({ ok: true, relay: WS_RELAY_PUBLIC_URL || null, rows: ZIP_TABLE.size })
 );
 
 /* =========================
    WEBSOCKET + AUTO SCHEMA
 ========================= */
-// Candidate outbound formats (ordered). We’ll bump if Relay sends 64107.
+// Outbound formats to try (ordered). We’ll bump on 64107 and resend.
 const SCHEMAS = [
   (text) => ({ type: "response", voiceResponse: text }),
   (text) => ({ type: "assistant", content: text }),
@@ -294,10 +238,6 @@ function trySend(socket, text, isRetry = false) {
     }
   } catch (e) {
     console.error("WS send error:", e);
-  }
-
-  if (!isRetry) {
-    // errors are handled on 'error' message path from Relay
   }
 }
 
@@ -336,7 +276,7 @@ wss.on("connection", (socket) => {
       const text = String(msg.voicePrompt || "").trim();
       const t = text.toLowerCase();
 
-      // Delivery ZIP intent
+      // ZIP intent
       const zips = t.match(/\b\d{5}\b/g) || [];
       const asksDelivery =
         /(delivery|deliver|minimum|min|fee|cost|lead ?time|eta|how long|time|timing)/.test(t);
@@ -409,7 +349,6 @@ const server = app.listen(PORT, async () => {
 });
 
 server.on("upgrade", (request, socket, head) => {
-  // Render passes only the path (no host), build a URL to get pathname
   const url = new URL(request.url, "http://localhost");
   if (url.pathname === "/relay") {
     wss.handleUpgrade(request, socket, head, (conn) => {
