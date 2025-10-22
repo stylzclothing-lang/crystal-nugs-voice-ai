@@ -1,93 +1,98 @@
-// server.js — Crystal Nugs Voice AI (ESM, Twilio ConversationRelay compatible)
-// - TwiML with <ConversationRelay ... welcomeGreeting="...">
-// - WebSocket replies as: { type: "text", token: "...", last: true }
-// - ZIP data from local JSON (CN_ZIP_DATA_PATH, e.g., ./data/zipzones.json)
-// - Answers: delivery minimum/fee/timing; hours/address/phone/website; safe fallback
-// - Admin: POST /admin/reload-zips  (Authorization: Bearer ADMIN_TOKEN)
+// server.js — Crystal Nugs Voice AI (keep ConversationRelay welcomeGreeting)
+// Adds local ZIP intent: returns JSON [{zip, fee, minimum, deliveryTime}] or spoken line
+// Uses your existing TwiML pattern and a WS endpoint at /relay
 
 import express from "express";
 import bodyParser from "body-parser";
-import "dotenv/config.js";
+import { config } from "dotenv";
+import twilio from "twilio";
 import { WebSocketServer } from "ws";
 import fs from "fs/promises";
 import path from "path";
-import { fileURLToPath } from "url";
 
-/* =========================
-   Setup
-========================= */
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+config();
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
 /* =========================
-   ENV
-========================= */
+   ENV / CONFIG
+   ========================= */
 const PORT = process.env.PORT || 8080;
 
-// Public base and relay URL (keep your existing greeting flow)
-const APP_BASE_URL = (process.env.APP_BASE_URL || "").replace(/\/$/, "");
-const WS_RELAY_PUBLIC_URL =
-  process.env.WS_RELAY_PUBLIC_URL ||
-  (APP_BASE_URL ? APP_BASE_URL.replace(/^http/, "wss") + "/relay" : "");
+// Public base. You already have PUBLIC_BASE_URL in your env list.
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "https://crystal-nugs-voice-ai.onrender.com").replace(/\/$/, "");
 
-// TTS for TwiML attributes (Relay handles actual speaking)
-const TTS_PROVIDER = process.env.TWILIO_TTS_PROVIDER || "Google";
-const TTS_VOICE = process.env.TWILIO_TTS_VOICE || "en-US-Wavenet-F";
+// Conversation Relay WS URL (wss). If not set, derive from PUBLIC_BASE_URL.
+const RELAY_PATH = process.env.TWILIO_WS_RELAY_PATH || "/relay";
+const TWILIO_RELAY_WSS_URL =
+  process.env.TWILIO_RELAY_WSS_URL || `${PUBLIC_BASE_URL.replace(/^http/, "wss")}${RELAY_PATH}`;
+
+// TwiML voice + greeting kept on the <ConversationRelay> element (like your working setup)
+const TTS_PROVIDER = process.env.TTS_PROVIDER || "Google";
+const TTS_VOICE = process.env.TTS_VOICE || "en-US-Wavenet-F";
 const WELCOME_GREETING =
-  process.env.CN_WELCOME ||
-  'Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?';
+  process.env.WELCOME_GREETING ||
+  "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?";
 
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+// Optional OpenAI fallback (not required)
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini";
 
-// Local ZIP data file path (in your repo: ./data/zipzones.json)
-const CN_ZIP_DATA_PATH = process.env.CN_ZIP_DATA_PATH || "./data/zipzones.json";
+// JSON vs speech output for local ZIP intent
+const OUTPUT_JSON = String(process.env.CN_OUTPUT_FORMAT || "speech").toLowerCase() === "json";
 
-// Common info (these can already be set in your env)
-const CN_HOURS = process.env.CN_HOURS || "We’re open daily; last call is ~90 minutes before close.";
-const CN_ADDRESS = process.env.CN_ADDRESS || "2300 J Street, Sacramento, CA 95816";
-const CN_PHONE = process.env.CN_PHONE || "+1 (916) 507-XXXX";
-const CN_WEBSITE = process.env.CN_WEBSITE || "crystalnugs.com";
+// Where to load your zone data
+const CN_ZIP_DATA_PATH = process.env.CN_ZIP_DATA_PATH || "./data/zip_rules.json";
 
 /* =========================
-   ZIP DATA
-========================= */
+   ZIP DATA LOADER (JSON/CSV)
+   Expected columns/keys (case-insensitive):
+   zipcode, delivery_minimum, delivery_fee, lead_time (mins), last_call (mins)
+   ========================= */
 let ZIP_TABLE = new Map(); // zip -> { min, fee, lead, lastCall }
 
-function normalizeRow(row) {
-  // normalize keys to snake_case
+const parseCsv = (raw) => {
+  const lines = raw.split(/\r?\n/).filter((l) => l.trim().length);
+  if (!lines.length) return [];
+  const header = lines[0].split(",").map((h) => h.trim().toLowerCase());
+  return lines.slice(1).map((line) => {
+    const cols = line.split(",").map((c) => c.trim());
+    const obj = {};
+    header.forEach((h, i) => (obj[h] = cols[i]));
+    return obj;
+  });
+};
+
+const normHeaders = (row) => {
   const nk = (k) => (k || "").toLowerCase().replace(/\s+/g, "_");
   const o = {};
-  Object.entries(row || {}).forEach(([k, v]) => (o[nk(k)] = v));
+  for (const [k, v] of Object.entries(row || {})) o[nk(k)] = v;
 
-  const zipcode = o.zipcode ?? o.zip ?? o.postal_code ?? o.postcode ?? o.code ?? o.zip_code;
-  const min = o.delivery_minimum ?? o.minimum ?? o.min ?? o.min_order ?? o.delivery_min;
-  const fee = o.delivery_fee ?? o.fee ?? o.delivery_cost ?? o.service_fee;
-  const lead = o.lead_time ?? o.lead ?? o.eta ?? o.lead_minutes;
-  const last = o.last_call ?? o.last_call_minutes;
+  const zipcode = o.zipcode ?? o.zip ?? o.postal_code ?? o.postcode ?? o.code ?? o["zip_code"];
+  const min = o.delivery_minimum ?? o.minimum ?? o.min ?? o.min_order;
+  const fee = o.delivery_fee ?? o.fee ?? o.delivery_cost;
+  const lead = o.lead_time ?? o.lead ?? o.eta ?? o["lead_minutes"];
+  const last = o.last_call ?? o["last_call_minutes"];
   return { zipcode, min, fee, lead, lastCall: last };
-}
+};
 
-async function bootZipTable() {
-  try {
-    const abs = path.resolve(__dirname, CN_ZIP_DATA_PATH);
-    const raw = await fs.readFile(abs, "utf8");
-    const ext = path.extname(abs).toLowerCase() || ".json";
-    if (ext !== ".json") throw new Error(`Only .json is supported for CN_ZIP_DATA_PATH (got ${ext})`);
+async function loadZipTable(filePath) {
+  const abs = path.resolve(process.cwd(), filePath);
+  const raw = await fs.readFile(abs, "utf8");
+  const ext = path.extname(abs).toLowerCase();
+  const map = new Map();
 
+  if (ext === ".json") {
     const data = JSON.parse(raw);
     const rows = Array.isArray(data)
       ? data
       : Object.entries(data).map(([zipcode, v]) => ({ zipcode, ...v }));
-
-    const map = new Map();
     for (const r of rows) {
-      const { zipcode, min, fee, lead, lastCall } = normalizeRow(r);
+      const { zipcode, min, fee, lead, lastCall } = normHeaders(r);
       const z = String(zipcode || "").replace(/\D/g, "");
-      if (!/^\d{5}$/.test(z)) continue;
+      if (!z) continue;
       const m = parseFloat(min);
       const f = parseFloat(fee);
       const ld = lead != null ? parseFloat(lead) : null;
@@ -95,27 +100,40 @@ async function bootZipTable() {
       if (!Number.isFinite(m) || !Number.isFinite(f)) continue;
       map.set(z, { min: m, fee: f, lead: ld, lastCall: lc });
     }
-
-    ZIP_TABLE = map;
-    console.log(`ZIP table loaded from file: ${CN_ZIP_DATA_PATH} — rows: ${ZIP_TABLE.size}`);
-  } catch (e) {
-    console.error("Failed to load ZIP table:", e.message);
-    ZIP_TABLE = new Map();
+  } else if (ext === ".csv") {
+    const rows = parseCsv(raw);
+    for (const r of rows) {
+      const { zipcode, min, fee, lead, lastCall } = normHeaders(r);
+      const z = String(zipcode || "").replace(/\D/g, "");
+      if (!z) continue;
+      const m = parseFloat(min);
+      const f = parseFloat(fee);
+      const ld = lead != null ? parseFloat(lead) : null;
+      const lc = lastCall != null ? parseFloat(lastCall) : null;
+      if (!Number.isFinite(m) || !Number.isFinite(f)) continue;
+      map.set(z, { min: m, fee: f, lead: ld, lastCall: lc });
+    }
+  } else {
+    console.warn(`Unsupported CN_ZIP_DATA_PATH: ${ext}. Use .json or .csv`);
   }
+
+  ZIP_TABLE = map;
+  console.log(`ZIP table loaded: ${ZIP_TABLE.size} rows from ${CN_ZIP_DATA_PATH}`);
 }
 
-/* =========================
-   Helpers
-========================= */
-function deliveryTimeText(row) {
-  const lead = Number.isFinite(row?.lead) ? row.lead : null;
-  if (lead == null || lead === 0) return "Generally 30 min to 2 hours";
+function zipDashed(zip) {
+  return String(zip).replace(/\D/g, "").split("").join("-");
+}
+
+// Map a numeric lead (mins) to your phrasing
+function deliveryTimeFromLead(lead) {
+  if (!Number.isFinite(lead) || lead <= 0) return "Generally 30 min to 2 hours";
   if (lead <= 30) return "Generally 1 hour to 2 hours";
-  if (lead >= 90) return "Generally 1 and a half hours to 2 and a half hours";
+  if (lead <= 45) return "Generally 1 and a half hours to 2 and a half hours";
   return "Generally 1 hour to 2 hours";
 }
 
-function buildZipRecord(zip) {
+function buildZipJSON(zip) {
   const z = String(zip).replace(/\D/g, "");
   const row = ZIP_TABLE.get(z);
   if (!row) return null;
@@ -123,207 +141,134 @@ function buildZipRecord(zip) {
     zip: z,
     fee: Number(row.fee),
     minimum: Number(row.min),
-    deliveryTime: deliveryTimeText(row),
+    deliveryTime: deliveryTimeFromLead(row.lead),
   };
 }
 
-function buildZipArray(zips) {
-  const seen = new Set();
-  const out = [];
-  for (const raw of zips) {
-    const z = String(raw).replace(/\D/g, "");
-    if (!/^\d{5}$/.test(z) || seen.has(z)) continue;
-    const rec = buildZipRecord(z);
-    if (rec) { out.push(rec); seen.add(z); }
-  }
-  return out;
-}
-
-function hyphenatedZip(zip) {
-  return String(zip).split("").join("-");
+function buildZipSpoken(zip) {
+  const item = buildZipJSON(zip);
+  if (!item) return `For zip code ${zipDashed(zip)}, I couldn't find a delivery zone. Can you try another zip code?`;
+  return `For zip code ${zipDashed(item.zip)}, the delivery minimum is $${item.minimum}, the delivery fee is $${item.fee.toFixed(
+    2
+  )}, and the delivery time is ${item.deliveryTime}.`;
 }
 
 /* =========================
-   TwiML (Conversation Relay)
-========================= */
+   Twilio TwiML — keep your working pattern
+   <Connect><ConversationRelay url="wss://.../relay" ttsProvider="Google" voice="en-US-Wavenet-F" welcomeGreeting="..."/>
+   ========================= */
 app.post("/twilio/voice", (req, res) => {
-  const relayUrl = WS_RELAY_PUBLIC_URL || "wss://crystal-nugs-voice-ai.onrender.com/relay";
-  const twiml =
-    `<?xml version="1.0" encoding="UTF-8"?>` +
-    `<Response>` +
-    `  <Connect>` +
-    `    <ConversationRelay` +
-    `      url="${relayUrl}"` +
-    `      ttsProvider="${TTS_PROVIDER}"` +
-    `      voice="${TTS_VOICE}"` +
-    `      welcomeGreeting="${escapeXml(WELCOME_GREETING)}" />` +
-    `  </Connect>` +
-    `</Response>`;
-  res.type("text/xml").send(twiml);
-});
-
-function escapeXml(s = "") {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-/* =========================
-   JSON API (batch zips)
-========================= */
-app.post("/intent/zip-batch", (req, res) => {
-  const zips = Array.isArray(req.body?.zips) ? req.body.zips : [];
-  if (!zips.length) return res.status(400).json({ ok: false, error: "Provide zips: string[]" });
-  const data = buildZipArray(zips);
-  if (!data.length) return res.status(404).json({ ok: false, error: "No matching zips" });
-  return res.json(data);
+  const vr = new twilio.twiml.VoiceResponse();
+  const connect = vr.connect();
+  connect.conversationRelay({
+    url: TWILIO_RELAY_WSS_URL,
+    ttsProvider: TTS_PROVIDER,
+    voice: TTS_VOICE,
+    welcomeGreeting: WELCOME_GREETING,
+  });
+  res.type("text/xml").send(vr.toString());
 });
 
 /* =========================
-   ADMIN: Hot reload data
-========================= */
-app.post("/admin/reload-zips", async (req, res) => {
-  const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-  try {
-    await bootZipTable();
-    return res.json({ ok: true, rows: ZIP_TABLE.size });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
+   Optional transfer endpoint (unchanged from your setup if you have one)
+   ========================= */
+app.post("/twilio/transfer", (req, res) => {
+  const vr = new twilio.twiml.VoiceResponse();
+  vr.say("Transferring you now.");
+  const dial = vr.dial({ callerId: req.body?.To || undefined });
+  dial.number(process.env.TWILIO_VOICE_FALLBACK || "+19165071099");
+  res.type("text/xml").send(vr.toString());
 });
 
 /* =========================
-   HEALTH
-========================= */
-app.get("/health", (req, res) =>
-  res.json({ ok: true, relay: WS_RELAY_PUBLIC_URL || null, rows: ZIP_TABLE.size })
-);
+   REST helper: batch zone lookup
+   GET /zones?zips=95827,95632,95758
+   ========================= */
+app.get("/zones", (req, res) => {
+  const q = String(req.query.zips || "");
+  const list = (q.match(/\b\d{5}\b/g) || []).map(buildZipJSON).filter(Boolean);
+  res.json(list);
+});
 
 /* =========================
-   WEBSOCKET (Conversation Relay)
-========================= */
-// Twilio Conversation Relay expects outbound "speak" messages as:
-//   { type: "text", token: "...", last: true }
+   WebSocket: /relay — local intent for ZIPs
+   - Detects any 5-digit ZIP(s) and delivery keywords
+   - Returns JSON array when CN_OUTPUT_FORMAT=json
+   - Else returns a spoken sentence for the first ZIP
+   ========================= */
 const wss = new WebSocketServer({ noServer: true });
 
-function say(socket, text, { last = true, lang } = {}) {
-  const payload = { type: "text", token: String(text ?? ""), last: Boolean(last) };
-  if (lang) payload.lang = lang; // optional
+function extractText(payload) {
+  // Try common shapes, else treat as raw text
   try {
-    socket.send(JSON.stringify(payload));
-    console.log("[WS OUT]", payload);
-  } catch (e) {
-    console.error("WS send error:", e);
+    const obj = JSON.parse(payload.toString());
+    return obj?.content || obj?.text || obj?.utterance || payload.toString();
+  } catch {
+    return payload.toString();
   }
 }
 
-wss.on("connection", (socket) => {
-  console.log("[WS] connected");
+wss.on("connection", (ws, req) => {
+  console.log("Twilio connected to Conversation Relay (WS):", req.url);
 
-  socket.on("message", async (data) => {
-    const raw = data.toString();
-    console.log("[WS IN]", raw);
+  ws.on("message", async (data) => {
+    const text = extractText(data);
+    const t = String(text || "").trim().toLowerCase();
 
-    let msg = {};
-    try { msg = JSON.parse(raw); } catch { return; }
+    // Delivery intent detector
+    const asksDelivery = /(delivery|deliver|minimum|min|fee|cost|lead ?time|eta|how long)/.test(t);
+    const zips = [...new Set((t.match(/\b\d{5}\b/g) || []))];
 
-    if (msg.type === "setup") return;
+    if (asksDelivery && zips.length) {
+      const items = zips.map(buildZipJSON).filter(Boolean);
 
-    if (msg.type === "prompt") {
-      const text = String(msg.voicePrompt || "").trim();
-      const t = text.toLowerCase();
-
-      // Delivery / ZIP intent
-      const zips = t.match(/\b\d{5}\b/g) || [];
-      const asksDelivery =
-        /(delivery|deliver|minimum|min|fee|cost|lead ?time|eta|how long|time|timing)/.test(t);
-
-      if (zips.length && asksDelivery) {
-        const arr = buildZipArray(zips);
-        if (arr.length) {
-          if (arr.length === 1) {
-            const r = arr[0];
-            const spokenZip = hyphenatedZip(r.zip); // "9-5-8-2-7"
-            say(
-              socket,
-              `For zip code ${spokenZip}, the delivery minimum is $${r.minimum}, the delivery fee is $${r.fee.toFixed(
-                2
-              )}. ${r.deliveryTime}.`
-            );
-          } else {
-            const first = arr
-              .slice(0, 3)
-              .map((r) => `${r.zip}: $${r.minimum} min, $${r.fee.toFixed(2)} fee`)
-              .join("; ");
-            say(socket, `I found ${arr.length} zip codes. ${first}.`);
-          }
-          return;
-        } else {
-          say(socket, "I couldn't find that delivery zone. Try another zip code.");
-          return;
-        }
+      if (!items.length) {
+        return ws.send(OUTPUT_JSON ? JSON.stringify([]) : "I couldn't find those zip codes. Can you try another?");
       }
 
-      // Hours / Address / Phone / Website quick intents
-      if (/\bhour|open|close|closing|last call\b/.test(t)) {
-        say(socket, CN_HOURS);
-        return;
+      if (OUTPUT_JSON) {
+        return ws.send(JSON.stringify(items));
+      } else {
+        // speak just the first; (you can loop if desired)
+        return ws.send(buildZipSpoken(items[0].zip));
       }
-      if (/\baddress|location|where\b/.test(t)) {
-        say(socket, CN_ADDRESS);
-        return;
-      }
-      if (/\bphone|call|number\b/.test(t)) {
-        say(socket, `Our phone number is ${CN_PHONE}.`);
-        return;
-      }
-      if (/\bwebsite|site|url\b/.test(t)) {
-        say(socket, `Our website is ${CN_WEBSITE}.`);
-        return;
-      }
-
-      // Fallback — never silent
-      say(
-        socket,
-        "I can help with delivery minimums, fees, and timing for any zip code. Try saying, delivery minimum for nine five eight two seven."
-      );
-      return;
     }
 
-    if (msg.type === "error") {
-      // Relay internal notices (we don't need to answer here)
-      console.warn("[WS ERROR from Relay]", msg.description);
-      return;
-    }
+    // Not a local ZIP intent: do nothing (let your upstream flow handle it).
+    // If you want a fallback prompt, uncomment:
+    // ws.send("I can help with delivery minimums, delivery fees, and delivery times if you tell me a 5-digit zip code.");
   });
 
-  socket.on("close", (code, reason) => {
-    console.log("[WS] closed", code, reason?.toString());
+  ws.on("close", (code, reason) => {
+    console.log("Twilio WS closed:", code, reason?.toString?.() || "");
   });
 });
 
-/* =========================
-   HTTP → WS upgrade
-========================= */
+// HTTP → WS upgrade only for /relay
 const server = app.listen(PORT, async () => {
-  await bootZipTable();
-  console.log(`Server :${PORT}`);
-  console.log(`Relay WS public URL: ${WS_RELAY_PUBLIC_URL || "(set WS_RELAY_PUBLIC_URL)"}`);
+  await loadZipTable(CN_ZIP_DATA_PATH).catch((e) => console.error(e));
+  console.log(`Crystal Nugs Voice AI on :${PORT}`);
+  console.log(`Relay (wss): ${TWILIO_RELAY_WSS_URL}`);
 });
 
 server.on("upgrade", (request, socket, head) => {
-  const url = new URL(request.url, "http://localhost");
-  if (url.pathname === "/relay") {
-    wss.handleUpgrade(request, socket, head, (conn) => {
-      wss.emit("connection", conn, request);
-    });
+  if (request.url && request.url.startsWith(RELAY_PATH)) {
+    wss.handleUpgrade(request, socket, head, (ws) => wss.emit("connection", ws, request));
   } else {
     socket.destroy();
   }
 });
+
+/* =========================
+   Health
+   ========================= */
+app.get("/health", (req, res) =>
+  res.json({
+    ok: true,
+    relayPath: RELAY_PATH,
+    relayWSS: TWILIO_RELAY_WSS_URL,
+    dataFile: CN_ZIP_DATA_PATH,
+    zipCount: ZIP_TABLE.size,
+    outputFormat: OUTPUT_JSON ? "json" : "speech",
+  })
+);
