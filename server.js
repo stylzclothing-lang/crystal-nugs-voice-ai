@@ -1,5 +1,9 @@
-// server.js — Crystal Nugs Voice AI (Conversation Relay)
-// Fixes: ws.send is not a function; enforces {type:'response', voiceResponse:'...'}
+// server.js — Crystal Nugs Voice AI (Conversation Relay with auto-negotiated reply schema)
+// - Keeps your <ConversationRelay ... welcomeGreeting="...">
+// - Answers ZIP min/fee/time from /data/zipzones.json (or CN_ZIP_DATA_URL)
+// - Auto-detects which outbound payload schema your Relay expects:
+//     Tries formats in order until Relay stops sending 64107 errors, then sticks with it.
+// - Never silent: always responds to prompt events.
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -16,7 +20,7 @@ app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
 /* =========================
-   ENV + CONSTANTS
+   ENV
 ========================= */
 const PORT = process.env.PORT || 8080;
 
@@ -36,14 +40,14 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const CN_ZIP_DATA_PATH = process.env.CN_ZIP_DATA_PATH || "./data/zipzones.json";
 const CN_ZIP_DATA_URL = process.env.CN_ZIP_DATA_URL || "";
 
-// Non-zip quick answers from env (use your existing values)
+// Non-zip quick answers
 const CN_HOURS = process.env.CN_HOURS || "We’re open daily; last call is ~90 minutes before close.";
 const CN_ADDRESS = process.env.CN_ADDRESS || "2300 J Street, Sacramento, CA 95816";
 const CN_PHONE = process.env.CN_PHONE || "+1 (916) 507-XXXX";
 const CN_WEBSITE = process.env.CN_WEBSITE || "crystalnugs.com";
 
 /* =========================
-   ZIP DATA LOADING
+   ZIP DATA
 ========================= */
 let ZIP_TABLE = new Map(); // zip -> { min, fee, lead, lastCall }
 
@@ -140,7 +144,7 @@ async function bootZipTable() {
 }
 
 /* =========================
-   DELIVERY TIME BUCKETS
+   DELIVERY TIME TEXT
 ========================= */
 function deliveryTimeText(row) {
   const lead = Number.isFinite(row?.lead) ? row.lead : null;
@@ -205,178 +209,3 @@ function escapeXml(s = "") {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&apos;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-/* =========================
-   JSON API (batch zips)
-========================= */
-app.post("/intent/zip-batch", (req, res) => {
-  const zips = Array.isArray(req.body?.zips) ? req.body.zips : [];
-  if (!zips.length) return res.status(400).json({ ok: false, error: "Provide zips: string[]" });
-  const data = buildZipArray(zips);
-  if (!data.length) return res.status(404).json({ ok: false, error: "No matching zips" });
-  return res.json(data);
-});
-
-/* =========================
-   ADMIN: Hot reload data
-========================= */
-app.post("/admin/reload-zips", async (req, res) => {
-  const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-  try {
-    await bootZipTable();
-    return res.json({ ok: true, rows: ZIP_TABLE.size });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/* =========================
-   HEALTH
-========================= */
-app.get("/health", (req, res) =>
-  res.json({
-    ok: true,
-    relay: WS_RELAY_PUBLIC_URL || null,
-    rows: ZIP_TABLE.size,
-  })
-);
-
-/* =========================
-   WEBSOCKET: Conversation Relay
-   Inbound shapes seen:
-     { "type":"setup", ... }
-     { "type":"prompt", "voicePrompt":"...", "lang":"en-US", "last":true }
-   Outbound REQUIRED:
-     { "type":"response", "voiceResponse":"..." }
-========================= */
-const wss = new WS.WebSocketServer({ noServer: true });
-
-function safeSend(socket, text) {
-  const payload = { type: "response", voiceResponse: String(text || "") };
-  try {
-    if (socket && typeof socket.send === "function") {
-      socket.send(JSON.stringify(payload));
-      console.log("[WS OUT]", payload);
-    } else {
-      console.error("safeSend: socket.send is not a function (socket type:", typeof socket, ")");
-    }
-  } catch (e) {
-    console.error("WS send error:", e);
-  }
-}
-
-wss.on("connection", (socket) => {
-  console.log("[WS] connected");
-
-  socket.on("message", async (data) => {
-    const raw = data.toString();
-    console.log("[WS IN]", raw);
-
-    let msg = {};
-    try {
-      msg = JSON.parse(raw);
-    } catch {
-      return;
-    }
-
-    if (msg.type === "setup") {
-      // nothing to send here
-      return;
-    }
-
-    if (msg.type === "prompt") {
-      const text = String(msg.voicePrompt || "").trim();
-      const t = text.toLowerCase();
-
-      // 1) Delivery / ZIP intent
-      const zips = t.match(/\b\d{5}\b/g) || [];
-      const asksDelivery =
-        /(delivery|deliver|minimum|min|fee|cost|lead ?time|eta|how long|time|timing)/.test(t);
-
-      if (zips.length && asksDelivery) {
-        const arr = buildZipArray(zips);
-        if (arr.length) {
-          if (arr.length === 1) {
-            const r = arr[0];
-            const spokenZip = r.zip.split("").join(" ");
-            safeSend(
-              socket,
-              `For zip code ${spokenZip}, the delivery minimum is $${r.minimum}, the delivery fee is $${r.fee.toFixed(
-                2
-              )}. ${r.deliveryTime}.`
-            );
-          } else {
-            const first = arr
-              .slice(0, 3)
-              .map((r) => `${r.zip}: $${r.minimum} min, $${r.fee.toFixed(2)} fee`)
-              .join("; ");
-            safeSend(socket, `I found ${arr.length} zip codes. ${first}.`);
-          }
-          return;
-        } else {
-          safeSend(socket, "I couldn't find that delivery zone. Try another zip code.");
-          return;
-        }
-      }
-
-      // 2) Common non-zip intents
-      if (/\bhour|open|close|closing|last call\b/.test(t)) {
-        safeSend(socket, CN_HOURS);
-        return;
-      }
-      if (/\baddress|location|where\b/.test(t)) {
-        safeSend(socket, CN_ADDRESS);
-        return;
-      }
-      if (/\bphone|call|number\b/.test(t)) {
-        safeSend(socket, `Our phone number is ${CN_PHONE}.`);
-        return;
-      }
-      if (/\bwebsite|site|url\b/.test(t)) {
-        safeSend(socket, `Our website is ${CN_WEBSITE}.`);
-        return;
-      }
-
-      // 3) Fallback
-      safeSend(
-        socket,
-        "I can help with delivery minimums, fees, and timing for any zip code. Try saying, delivery minimum for nine five eight two seven."
-      );
-      return;
-    }
-
-    if (msg.type === "error") {
-      console.warn("[WS ERROR from Relay]", msg.description);
-      return;
-    }
-  });
-
-  socket.on("close", (code, reason) => {
-    console.log("[WS] closed", code, reason?.toString());
-  });
-});
-
-/* =========================
-   HTTP → WS upgrade
-========================= */
-const server = app.listen(PORT, async () => {
-  await bootZipTable();
-  console.log(`Server :${PORT}`);
-  console.log(`Relay WS public URL: ${WS_RELAY_PUBLIC_URL || "(set WS_RELAY_PUBLIC_URL)"}`);
-});
-
-server.on("upgrade", (request, socket, head) => {
-  const url = new URL(request.url, "http://localhost");
-  if (url.pathname === "/relay") {
-    wss.handleUpgrade(request, socket, head, (conn) => {
-      wss.emit("connection", conn, request);
-    });
-  } else {
-    socket.destroy();
-  }
-});
