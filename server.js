@@ -1,15 +1,19 @@
-// server.js — Crystal Nugs Voice AI (CommonJS, local JSON only)
+// server.js — ESM build (type: module)
 // - TwiML with <ConversationRelay ... welcomeGreeting="...">
-// - WS auto-negotiates outbound message shape to avoid 64107 (Invalid message)
-// - Loads ZIP data ONLY from local file CN_ZIP_DATA_PATH (no remote fetch)
-// - Answers ZIP min/fee/time + hours/address/phone/website + fallback
+// - WS: auto-negotiates outbound payload shape to avoid 64107
+// - Loads ZIP data from local JSON (CN_ZIP_DATA_PATH)
+// - Answers ZIP min/fee/time; plus hours/address/phone/site; fallback
 
-const express = require("express");
-const bodyParser = require("body-parser");
-require("dotenv").config();
-const { WebSocketServer } = require("ws");
-const fs = require("fs/promises");
-const path = require("path");
+import express from "express";
+import bodyParser from "body-parser";
+import "dotenv/config.js";
+import { WebSocketServer } from "ws";
+import fs from "fs/promises";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -34,7 +38,7 @@ const WELCOME_GREETING =
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const CN_ZIP_DATA_PATH = process.env.CN_ZIP_DATA_PATH || "./data/zipzones.json";
 
-// Non-zip quick answers (use your existing envs if set)
+// Non-zip quick answers (your existing envs still work)
 const CN_HOURS = process.env.CN_HOURS || "We’re open daily; last call is ~90 minutes before close.";
 const CN_ADDRESS = process.env.CN_ADDRESS || "2300 J Street, Sacramento, CA 95816";
 const CN_PHONE = process.env.CN_PHONE || "+1 (916) 507-XXXX";
@@ -60,21 +64,18 @@ function normalizeRow(row) {
 
 async function bootZipTable() {
   try {
-    const abs = path.resolve(process.cwd(), CN_ZIP_DATA_PATH);
+    const abs = path.resolve(__dirname, CN_ZIP_DATA_PATH);
     const raw = await fs.readFile(abs, "utf8");
 
     const ext = path.extname(abs).toLowerCase() || ".json";
-    const map = new Map();
-
-    if (ext !== ".json") {
-      throw new Error(`Only .json supported in this build. Got: ${ext}`);
-    }
+    if (ext !== ".json") throw new Error(`Only .json supported here. Got: ${ext}`);
 
     const data = JSON.parse(raw);
     const rows = Array.isArray(data)
       ? data
       : Object.entries(data).map(([zipcode, v]) => ({ zipcode, ...v }));
 
+    const map = new Map();
     for (const r of rows) {
       const { zipcode, min, fee, lead, lastCall } = normalizeRow(r);
       const z = String(zipcode || "").replace(/\D/g, "");
@@ -128,10 +129,7 @@ function buildZipArray(zips) {
     const z = String(raw).replace(/\D/g, "");
     if (!/^\d{5}$/.test(z) || seen.has(z)) continue;
     const rec = buildZipRecord(z);
-    if (rec) {
-      out.push(rec);
-      seen.add(z);
-    }
+    if (rec) { out.push(rec); seen.add(z); }
   }
   return out;
 }
@@ -256,11 +254,7 @@ wss.on("connection", (socket) => {
     console.log("[WS IN]", raw);
 
     let msg = {};
-    try {
-      msg = JSON.parse(raw);
-    } catch {
-      return;
-    }
+    try { msg = JSON.parse(raw); } catch { return; }
 
     if (msg.type === "setup") return;
 
