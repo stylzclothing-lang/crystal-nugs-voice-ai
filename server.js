@@ -1,14 +1,10 @@
-// server.js — Crystal Nugs Voice AI (Conversation Relay compatible)
-// - TwiML with <ConversationRelay ... welcomeGreeting="...">
-// - WS handler that replies with: { type: "response", voiceResponse: "..." }
-// - ZIP data from local file (CN_ZIP_DATA_PATH) or URL (CN_ZIP_DATA_URL)
-// - Answers: minimum, fee, delivery time buckets; also hours/address/phone/site
-// - Hot reload: POST /admin/reload-zips  (Authorization: Bearer ADMIN_TOKEN)
+// server.js — Crystal Nugs Voice AI (Conversation Relay)
+// Fixes: ws.send is not a function; enforces {type:'response', voiceResponse:'...'}
 
 import express from "express";
 import bodyParser from "body-parser";
-import { WebSocketServer } from "ws";
 import { config } from "dotenv";
+import * as WS from "ws";
 import fs from "fs/promises";
 import path from "path";
 import fetch from "node-fetch";
@@ -19,9 +15,9 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
-/* -------------------------
-   ENV
--------------------------- */
+/* =========================
+   ENV + CONSTANTS
+========================= */
 const PORT = process.env.PORT || 8080;
 
 const APP_BASE_URL = (process.env.APP_BASE_URL || "").replace(/\/$/, "");
@@ -40,15 +36,15 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const CN_ZIP_DATA_PATH = process.env.CN_ZIP_DATA_PATH || "./data/zipzones.json";
 const CN_ZIP_DATA_URL = process.env.CN_ZIP_DATA_URL || "";
 
-// Business info fallbacks for non-zip intents
+// Non-zip quick answers from env (use your existing values)
 const CN_HOURS = process.env.CN_HOURS || "We’re open daily; last call is ~90 minutes before close.";
 const CN_ADDRESS = process.env.CN_ADDRESS || "2300 J Street, Sacramento, CA 95816";
 const CN_PHONE = process.env.CN_PHONE || "+1 (916) 507-XXXX";
 const CN_WEBSITE = process.env.CN_WEBSITE || "crystalnugs.com";
 
-/* -------------------------
+/* =========================
    ZIP DATA LOADING
--------------------------- */
+========================= */
 let ZIP_TABLE = new Map(); // zip -> { min, fee, lead, lastCall }
 
 const parseCsv = (raw) => {
@@ -143,9 +139,9 @@ async function bootZipTable() {
   }
 }
 
-/* -------------------------
+/* =========================
    DELIVERY TIME BUCKETS
--------------------------- */
+========================= */
 function deliveryTimeText(row) {
   const lead = Number.isFinite(row?.lead) ? row.lead : null;
   if (lead == null || lead === 0) return "Generally 30 min to 2 hours";
@@ -154,9 +150,9 @@ function deliveryTimeText(row) {
   return "Generally 1 hour to 2 hours";
 }
 
-/* -------------------------
+/* =========================
    BUILD RESPONSES
--------------------------- */
+========================= */
 function buildZipRecord(zip) {
   const z = String(zip).replace(/\D/g, "");
   const row = ZIP_TABLE.get(z);
@@ -184,9 +180,9 @@ function buildZipArray(zips) {
   return out;
 }
 
-/* -------------------------
+/* =========================
    TwiML (Conversation Relay)
--------------------------- */
+========================= */
 app.post("/twilio/voice", (req, res) => {
   const relayUrl = WS_RELAY_PUBLIC_URL || "wss://crystal-nugs-voice-ai.onrender.com/relay";
   const twiml =
@@ -212,9 +208,9 @@ function escapeXml(s = "") {
     .replace(/>/g, "&gt;");
 }
 
-/* -------------------------
+/* =========================
    JSON API (batch zips)
--------------------------- */
+========================= */
 app.post("/intent/zip-batch", (req, res) => {
   const zips = Array.isArray(req.body?.zips) ? req.body.zips : [];
   if (!zips.length) return res.status(400).json({ ok: false, error: "Provide zips: string[]" });
@@ -223,9 +219,9 @@ app.post("/intent/zip-batch", (req, res) => {
   return res.json(data);
 });
 
-/* -------------------------
+/* =========================
    ADMIN: Hot reload data
--------------------------- */
+========================= */
 app.post("/admin/reload-zips", async (req, res) => {
   const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
   if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) {
@@ -239,9 +235,9 @@ app.post("/admin/reload-zips", async (req, res) => {
   }
 });
 
-/* -------------------------
+/* =========================
    HEALTH
--------------------------- */
+========================= */
 app.get("/health", (req, res) =>
   res.json({
     ok: true,
@@ -250,44 +246,46 @@ app.get("/health", (req, res) =>
   })
 );
 
-/* -------------------------
+/* =========================
    WEBSOCKET: Conversation Relay
-   INBOUND messages we've seen:
+   Inbound shapes seen:
      { "type":"setup", ... }
      { "type":"prompt", "voicePrompt":"...", "lang":"en-US", "last":true }
-   OUTBOUND message REQUIRED shape:
-     { "type":"response", "voiceResponse":"<what to speak back>" }
--------------------------- */
-const wss = new WebSocketServer({ noServer: true });
+   Outbound REQUIRED:
+     { "type":"response", "voiceResponse":"..." }
+========================= */
+const wss = new WS.WebSocketServer({ noServer: true });
 
-function sendVoice(ws, text) {
+function safeSend(socket, text) {
   const payload = { type: "response", voiceResponse: String(text || "") };
   try {
-    ws.send(JSON.stringify(payload));
-    console.log("[WS OUT]", payload);
+    if (socket && typeof socket.send === "function") {
+      socket.send(JSON.stringify(payload));
+      console.log("[WS OUT]", payload);
+    } else {
+      console.error("safeSend: socket.send is not a function (socket type:", typeof socket, ")");
+    }
   } catch (e) {
     console.error("WS send error:", e);
   }
 }
 
-wss.on("connection", (ws) => {
+wss.on("connection", (socket) => {
   console.log("[WS] connected");
 
-  ws.on("message", async (data) => {
+  socket.on("message", async (data) => {
     const raw = data.toString();
     console.log("[WS IN]", raw);
 
-    // Parse incoming (Relay sends JSON)
     let msg = {};
     try {
       msg = JSON.parse(raw);
     } catch {
-      // If not JSON, ignore
       return;
     }
 
     if (msg.type === "setup") {
-      // optional: greet or log
+      // nothing to send here
       return;
     }
 
@@ -295,7 +293,7 @@ wss.on("connection", (ws) => {
       const text = String(msg.voicePrompt || "").trim();
       const t = text.toLowerCase();
 
-      // find any 5-digit zips
+      // 1) Delivery / ZIP intent
       const zips = t.match(/\b\d{5}\b/g) || [];
       const asksDelivery =
         /(delivery|deliver|minimum|min|fee|cost|lead ?time|eta|how long|time|timing)/.test(t);
@@ -303,49 +301,50 @@ wss.on("connection", (ws) => {
       if (zips.length && asksDelivery) {
         const arr = buildZipArray(zips);
         if (arr.length) {
-          // Build a human-friendly spoken line
           if (arr.length === 1) {
             const r = arr[0];
             const spokenZip = r.zip.split("").join(" ");
-            sendVoice(
+            safeSend(
+              socket,
               `For zip code ${spokenZip}, the delivery minimum is $${r.minimum}, the delivery fee is $${r.fee.toFixed(
                 2
               )}. ${r.deliveryTime}.`
             );
           } else {
-            // summarize first few and count
-            const first = arr.slice(0, 3).map((r) => `${r.zip}: $${r.minimum} min, $${r.fee.toFixed(2)} fee`).join("; ");
-            sendVoice(
-              `I found ${arr.length} zip codes. ${first}. If you want all details, I can text you a link.`
-            );
+            const first = arr
+              .slice(0, 3)
+              .map((r) => `${r.zip}: $${r.minimum} min, $${r.fee.toFixed(2)} fee`)
+              .join("; ");
+            safeSend(socket, `I found ${arr.length} zip codes. ${first}.`);
           }
           return;
         } else {
-          sendVoice("I couldn't find that delivery zone. Try another zip code.");
+          safeSend(socket, "I couldn't find that delivery zone. Try another zip code.");
           return;
         }
       }
 
-      // Common non-zip intents
+      // 2) Common non-zip intents
       if (/\bhour|open|close|closing|last call\b/.test(t)) {
-        sendVoice(CN_HOURS);
+        safeSend(socket, CN_HOURS);
         return;
       }
       if (/\baddress|location|where\b/.test(t)) {
-        sendVoice(CN_ADDRESS);
+        safeSend(socket, CN_ADDRESS);
         return;
       }
       if (/\bphone|call|number\b/.test(t)) {
-        sendVoice(`Our phone number is ${CN_PHONE}.`);
+        safeSend(socket, `Our phone number is ${CN_PHONE}.`);
         return;
       }
       if (/\bwebsite|site|url\b/.test(t)) {
-        sendVoice(`Our website is ${CN_WEBSITE}.`);
+        safeSend(socket, `Our website is ${CN_WEBSITE}.`);
         return;
       }
 
-      // fallback so we never stay silent
-      sendVoice(
+      // 3) Fallback
+      safeSend(
+        socket,
         "I can help with delivery minimums, fees, and timing for any zip code. Try saying, delivery minimum for nine five eight two seven."
       );
       return;
@@ -353,19 +352,18 @@ wss.on("connection", (ws) => {
 
     if (msg.type === "error") {
       console.warn("[WS ERROR from Relay]", msg.description);
-      // no response needed
       return;
     }
   });
 
-  ws.on("close", (code, reason) => {
+  socket.on("close", (code, reason) => {
     console.log("[WS] closed", code, reason?.toString());
   });
 });
 
-/* -------------------------
+/* =========================
    HTTP → WS upgrade
--------------------------- */
+========================= */
 const server = app.listen(PORT, async () => {
   await bootZipTable();
   console.log(`Server :${PORT}`);
@@ -375,8 +373,8 @@ const server = app.listen(PORT, async () => {
 server.on("upgrade", (request, socket, head) => {
   const url = new URL(request.url, "http://localhost");
   if (url.pathname === "/relay") {
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit("connection", ws, request);
+    wss.handleUpgrade(request, socket, head, (conn) => {
+      wss.emit("connection", conn, request);
     });
   } else {
     socket.destroy();
