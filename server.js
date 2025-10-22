@@ -1,9 +1,9 @@
-// server.js — Crystal Nugs Voice AI — SSML digit ZIP + external ZIP rules (JSON/CSV)
-// Twilio Conversation Relay + Local intents + OpenAI fallback
-// © Crystal Nugs
+// server.js — Crystal Nugs Voice AI
+// Express + Twilio + WebSocket + SSML digit ZIPs + external ZIP rules (JSON/CSV)
+// Valid TwiML: <Say> BEFORE <Connect>, no <Say> inside <ConversationRelay>/<Stream>
 
 import express from "express";
-import { WebSocketServer, WebSocket } from "ws";
+import { WebSocketServer } from "ws";
 import bodyParser from "body-parser";
 import { config } from "dotenv";
 import twilio from "twilio";
@@ -30,16 +30,18 @@ const USE_SSML = String(process.env.CN_USE_SSML || "false").toLowerCase() === "t
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
-const TWILIO_APP_BASE = process.env.APP_BASE_URL || "https://your-app.example.com";
-const TWILIO_WS_RELAY_URL =
-  process.env.TWILIO_WS_RELAY_URL || `${TWILIO_APP_BASE.replace(/\/$/, "")}/ws/relay`;
+
+const APP_BASE_URL = (process.env.APP_BASE_URL || "https://your-app.example.com").replace(/\/$/, "");
+const RELAY_PATH = process.env.TWILIO_WS_RELAY_PATH || "/ws/relay";
+const TWILIO_WS_RELAY_URL = process.env.TWILIO_WS_RELAY_URL || `${APP_BASE_URL}${RELAY_PATH}`;
+
+// Set CN_USE_STREAMS=true to use <Stream> (wss://) instead of Conversation Relay (https://)
+const USE_STREAMS = String(process.env.CN_USE_STREAMS || "false").toLowerCase() === "true";
 
 const CN_ZIP_DATA_PATH = process.env.CN_ZIP_DATA_PATH || "./data/zip_rules.json";
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || ""; // for /admin/reload-zips
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 
-const HOURS =
-  process.env.CN_HOURS ||
-  "Mon–Sun 9am–9pm (Delivery last call 90 minutes before close).";
+const HOURS = process.env.CN_HOURS || "Mon–Sun 9am–9pm (Delivery last call 90 minutes before close).";
 const BRAND = process.env.CN_BRAND || "Crystal Nugs Dispensary, 2300 J Street, Sacramento";
 
 // SSML allow-list
@@ -59,6 +61,7 @@ const zipForVoice = (zip) => {
 const sanitize = (str) => {
   if (!str) return "";
   if (!USE_SSML) return String(str).replace(/<[^>]+>/g, "");
+  // keep only whitelisted SSML tags
   return String(str).replace(/<([^/\s>]+)([^>]*)>|<\/([^>]+)>/g, (m, openTag, attrs, closeTag) => {
     const tag = (openTag || closeTag || "").toLowerCase();
     return ALLOW_SSML_TAGS.has(tag) ? m : "";
@@ -70,14 +73,12 @@ const beat = (ms = 150) => (USE_SSML ? `<break time="${ms}ms"/>` : " ");
 /* =========================
    ZIP RULES: LOAD FROM FILE
    ========================= */
-
 let ZIP_RULES = new Map(); // zip -> { min, fee }
 const DEFAULT_ZONE = { min: 80, fee: 1.99 };
 
 const parseCsv = (raw) => {
-  // very light CSV parser (commas). Accepts headers.
   const lines = raw.split(/\r?\n/).filter((l) => l.trim().length);
-  if (lines.length === 0) return [];
+  if (!lines.length) return [];
   const header = lines[0].split(",").map((h) => h.trim().toLowerCase());
   const rows = lines.slice(1).map((line) => {
     const cols = line.split(",").map((c) => c.trim());
@@ -89,26 +90,18 @@ const parseCsv = (raw) => {
 };
 
 const normalizeHeaders = (obj) => {
-  // map various header spellings to {zipcode, min, fee}
-  const mapKey = (k) => (k || "").toLowerCase().replace(/\s+/g, "_");
-  const out = {};
-  for (const [k, v] of Object.entries(obj || {})) {
-    out[mapKey(k)] = v;
-  }
+  const nk = (k) => (k || "").toLowerCase().replace(/\s+/g, "_");
+  const o = {};
+  for (const [k, v] of Object.entries(obj || {})) o[nk(k)] = v;
 
-  const z =
-    out.zipcode ?? out.zip ?? out.postal_code ?? out.postcode ?? out.code ?? out["zip_code"];
+  const zipcode =
+    o.zipcode ?? o.zip ?? o.postal_code ?? o.postcode ?? o.code ?? o["zip_code"];
   const min =
-    out.delivery_minimum ??
-    out.minimum ??
-    out.min ??
-    out.min_order ??
-    out["delivery_min"] ??
-    out["min_delivery"];
+    o.delivery_minimum ?? o.minimum ?? o.min ?? o.min_order ?? o.delivery_min ?? o.min_delivery;
   const fee =
-    out.delivery_fee ?? out.fee ?? out["delivery_cost"] ?? out["service_fee"] ?? out["d_fee"];
+    o.delivery_fee ?? o.fee ?? o.delivery_cost ?? o.service_fee ?? o.d_fee;
 
-  return { zipcode: z, min, fee };
+  return { zipcode, min, fee };
 };
 
 async function loadZipRulesFromFile(filePath) {
@@ -120,7 +113,6 @@ async function loadZipRulesFromFile(filePath) {
 
   if (ext === ".json") {
     const data = JSON.parse(raw);
-    // Accept array of objects or object keyed by zip
     if (Array.isArray(data)) {
       for (const row of data) {
         const { zipcode, min, fee } = normalizeHeaders(row);
@@ -154,13 +146,7 @@ async function loadZipRulesFromFile(filePath) {
       map.set(z, { min: m, fee: f });
     }
   } else {
-    throw new Error(
-      `Unsupported CN_ZIP_DATA_PATH extension "${ext}". Use .json or .csv (got: ${abs}).`
-    );
-  }
-
-  if (map.size === 0) {
-    console.warn("ZIP rules file parsed but produced 0 rows. Using empty map.");
+    throw new Error(`Unsupported CN_ZIP_DATA_PATH "${ext}". Use .json or .csv`);
   }
 
   return map;
@@ -172,7 +158,6 @@ async function bootZipRules() {
     console.log(`Loaded ${ZIP_RULES.size} ZIP rules from ${CN_ZIP_DATA_PATH}`);
   } catch (e) {
     console.error("Failed to load ZIP rules:", e.message);
-    console.error("Continuing with empty map (DEFAULT_ZONE will apply).");
     ZIP_RULES = new Map();
   }
 }
@@ -213,8 +198,7 @@ app.post("/admin/reload-zips", async (req, res) => {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
   try {
-    const fresh = await loadZipRulesFromFile(CN_ZIP_DATA_PATH);
-    ZIP_RULES = fresh;
+    ZIP_RULES = await loadZipRulesFromFile(CN_ZIP_DATA_PATH);
     return res.json({ ok: true, count: ZIP_RULES.size, file: CN_ZIP_DATA_PATH });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
@@ -240,8 +224,7 @@ async function openAiChat(messages, system = "You are a helpful Crystal Nugs ass
       }),
     });
     const j = await r.json();
-    const content = j?.choices?.[0]?.message?.content || "";
-    return content;
+    return j?.choices?.[0]?.message?.content || "";
   } catch (e) {
     console.error("OpenAI error:", e);
     return null;
@@ -256,24 +239,34 @@ const twilioClient =
     ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     : null;
 
+// Main voice entry — Say welcome first, then Connect → ConversationRelay or Stream
 app.post("/twilio/voice", async (req, res) => {
   const vr = new twilio.twiml.VoiceResponse();
-  const welcome = sanitize(
-    speak(
-      `${BRAND}.${beat(100)} How can I help you today? If you need a person at any time, say "transfer".`
-    )
-  );
 
+  // 1) Welcome MUST be a peer (not child) of <Connect>
+  const welcome = sanitize(
+    speak(`${BRAND}.${beat(100)} How can I help you today? If you need a person at any time, say "transfer".`)
+  );
+  vr.say({ voice: "Polly.Joanna-Neural" }, welcome);
+
+  // 2) Connect: ConversationRelay (https) OR Media Streams (wss)
   const connect = vr.connect();
-  connect
-    .conversationRelay({
-      url: TWILIO_WS_RELAY_URL,
-    })
-    .say({ voice: "Polly.Joanna-Neural" }, welcome);
+
+  if (!USE_STREAMS) {
+    // Conversation Relay (Twilio feature; ensure enabled on your account)
+    connect.conversationRelay({
+      url: TWILIO_WS_RELAY_URL, // e.g. https://your-app/ws/relay
+    });
+  } else {
+    // Media Streams fallback (requires wss://)
+    const wsUrl = TWILIO_WS_RELAY_URL.replace(/^http/, "wss");
+    connect.stream({ url: wsUrl });
+  }
 
   res.type("text/xml").send(vr.toString());
 });
 
+// Fallback human transfer
 app.post("/twilio/transfer", async (req, res) => {
   const vr = new twilio.twiml.VoiceResponse();
   const s = sanitize(speak(`No problem.${beat()}Transferring you now.`));
@@ -283,6 +276,7 @@ app.post("/twilio/transfer", async (req, res) => {
   res.type("text/xml").send(vr.toString());
 });
 
+// Status callback
 app.post("/twilio/status", (req, res) => {
   try {
     console.log("Call status:", {
@@ -292,7 +286,7 @@ app.post("/twilio/status", (req, res) => {
       From: req.body.From,
       To: req.body.To,
     });
-  } catch (e) {}
+  } catch {}
   res.sendStatus(200);
 });
 
@@ -311,9 +305,9 @@ function wsSend(ws, obj) {
 }
 
 async function handleUserText(ws, text) {
-  const t = text.trim().toLowerCase();
+  const t = String(text || "").trim().toLowerCase();
 
-  // detect ZIP mentions + delivery questions
+  // ZIP intents like: "delivery minimum for 95827"
   const zipMatch = t.match(/\b(9\d{4}|8\d{4}|7\d{4}|6\d{4}|5\d{4})\b/);
   if (zipMatch && /(delivery.*min|minimum|fee|deliver)/.test(t)) {
     const zip = zipMatch[1];
@@ -321,23 +315,28 @@ async function handleUserText(ws, text) {
     return wsSend(ws, { type: "assistant", modality: "speech", content: speech });
   }
 
+  // transfer intent
   if (/transfer|human|agent|representative/.test(t)) {
     const msg = sanitize(speak(`No problem.${beat()}Transferring you now.`));
     return wsSend(ws, { type: "assistant", modality: "command", action: "transfer", content: msg });
   }
 
+  // hours intent
   if (/hour|open|close|closing|last call/.test(t)) {
     const out = sanitize(speak(`${HOURS}`));
     return wsSend(ws, { type: "assistant", modality: "speech", content: out });
   }
 
   // fallback to OpenAI
-  const ai = await openAiChat([{ role: "user", content: text }], `You are the Crystal Nugs assistant.
+  const ai = await openAiChat(
+    [{ role: "user", content: text }],
+    `You are the Crystal Nugs assistant.
 - Be concise and friendly.
 - If the user mentions a 5-digit number that looks like a ZIP and asks about delivery, respond with the delivery minimum and fee using the format rules:
   * ZIP must be read as digits via <say-as interpret-as="digits"> if SSML is enabled (USE_SSML=${USE_SSML}).
   * Otherwise render as "9-5-8-2-7".
-- If the user asks to transfer, reply with a short acknowledgment "Transferring you now." and the client will handle the transfer.`);
+- If the user asks to transfer, reply with a short acknowledgment "Transferring you now."`
+  );
 
   const fallback = ai || "I can help with delivery minimums, hours, and transfers.";
   const safe = sanitize(USE_SSML ? speak(fallback) : fallback);
@@ -347,6 +346,7 @@ async function handleUserText(ws, text) {
 wss.on("connection", (ws, req) => {
   const id = Math.random().toString(36).slice(2);
   SESSIONS.set(id, ws);
+
   ws.on("message", async (data) => {
     let msg = null;
     try {
@@ -373,15 +373,16 @@ wss.on("connection", (ws, req) => {
   });
 });
 
-// HTTP→WS upgrade
+// HTTP→WS upgrade only for our relay path
 const server = app.listen(PORT, async () => {
   await bootZipRules();
   console.log(`Crystal Nugs Voice AI running on :${PORT}`);
+  console.log(`Relay endpoint: ${RELAY_PATH} (${USE_STREAMS ? "Media Streams (wss)" : "Conversation Relay (https)"})`);
 });
 
 server.on("upgrade", (request, socket, head) => {
   const { url } = request;
-  if (url && url.startsWith("/ws/relay")) {
+  if (url && url.startsWith(RELAY_PATH)) {
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit("connection", ws, request);
     });
@@ -394,7 +395,14 @@ server.on("upgrade", (request, socket, head) => {
    HEALTH + DIAGNOSTICS
    ========================= */
 app.get("/health", (req, res) =>
-  res.json({ ok: true, service: "crystal-nugs-voice-ai", zips: ZIP_RULES.size })
+  res.json({
+    ok: true,
+    service: "crystal-nugs-voice-ai",
+    zips: ZIP_RULES.size,
+    ssml: USE_SSML,
+    mode: USE_STREAMS ? "streams" : "relay",
+    relayUrl: TWILIO_WS_RELAY_URL,
+  })
 );
 
 app.get("/debug/zip/:zip", (req, res) => {
