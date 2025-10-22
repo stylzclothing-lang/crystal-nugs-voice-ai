@@ -1,6 +1,6 @@
-// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F)
-// Conversation Relay (TEXT) + Local Intents + ZIP delivery lookup + OpenAI fallback
-// Energetic SSML brand voice preset
+// server.js — Crystal Nugs Voice AI — SSML digit ZIP + external ZIP rules (JSON/CSV)
+// Twilio Conversation Relay + Local intents + OpenAI fallback
+// © Crystal Nugs
 
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
@@ -8,7 +8,7 @@ import bodyParser from "body-parser";
 import { config } from "dotenv";
 import twilio from "twilio";
 import fetch from "node-fetch";
-import fs from "fs";
+import fs from "fs/promises";
 import path from "path";
 
 config();
@@ -17,417 +17,394 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
+/* =========================
+   ENV + CONSTANTS
+   ========================= */
 const PORT = process.env.PORT || 8080;
+
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini";
-const TRANSFER_NUMBER = process.env.TWILIO_VOICE_FALLBACK || "+19165071099";
-const USE_SSML = String(process.env.CN_USE_SSML || "true").toLowerCase() === "true";
 
-// ===== Business Facts (env-driven; update in Render → Environment) =====
+const TRANSFER_NUMBER = process.env.TWILIO_VOICE_FALLBACK || "+19165071099";
+const USE_SSML = String(process.env.CN_USE_SSML || "false").toLowerCase() === "true";
+
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+const TWILIO_APP_BASE = process.env.APP_BASE_URL || "https://your-app.example.com";
+const TWILIO_WS_RELAY_URL =
+  process.env.TWILIO_WS_RELAY_URL || `${TWILIO_APP_BASE.replace(/\/$/, "")}/ws/relay`;
+
+const CN_ZIP_DATA_PATH = process.env.CN_ZIP_DATA_PATH || "./data/zip_rules.json";
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || ""; // for /admin/reload-zips
+
 const HOURS =
   process.env.CN_HOURS ||
-  "Our dispensary is open daily from 9:00 AM to 9:00 PM, and we take delivery orders from 8:30 AM to 8:30 PM.";
+  "Mon–Sun 9am–9pm (Delivery last call 90 minutes before close).";
+const BRAND = process.env.CN_BRAND || "Crystal Nugs Dispensary, 2300 J Street, Sacramento";
 
-const ADDRESS = process.env.CN_ADDRESS || "2300 J Street, Sacramento, CA 95816";
+// SSML allow-list
+const ALLOW_SSML_TAGS = new Set(["speak", "say-as", "break"]);
 
-const ID_RULES =
-  process.env.CN_ID_RULES ||
-  "You’ll need a valid government-issued photo ID and be at least 21+.";
+/* =========================
+   SSML / OUTPUT HELPERS
+   ========================= */
+const speak = (text) => (USE_SSML ? `<speak>${text}</speak>` : text);
 
-const DELIVERY =
-  process.env.CN_DELIVERY ||
-  "We deliver to Midtown and the greater Sacramento area including Citrus Heights, Roseville, Lincoln, Folsom, Elk Grove, and more. Share your address to confirm delivery.";
+const zipForVoice = (zip) => {
+  const z = String(zip).replace(/\D/g, "");
+  if (!z) return USE_SSML ? `<say-as interpret-as="digits">00000</say-as>` : "0-0-0-0-0";
+  return USE_SSML ? `<say-as interpret-as="digits">${z}</say-as>` : z.split("").join("-");
+};
 
-const DELIV_MIN =
-  process.env.CN_DELIVERY_MINIMUM ||
-  "Order minimums depend on where you’re located — for the immediate Sacramento area, it’s just $40.";
+const sanitize = (str) => {
+  if (!str) return "";
+  if (!USE_SSML) return String(str).replace(/<[^>]+>/g, "");
+  return String(str).replace(/<([^/\s>]+)([^>]*)>|<\/([^>]+)>/g, (m, openTag, attrs, closeTag) => {
+    const tag = (openTag || closeTag || "").toLowerCase();
+    return ALLOW_SSML_TAGS.has(tag) ? m : "";
+  });
+};
 
-const DELIV_FEE =
-  process.env.CN_DELIVERY_FEE ||
-  "Enjoy fast delivery for just $1.99 on most orders.";
+const beat = (ms = 150) => (USE_SSML ? `<break time="${ms}ms"/>` : " ");
 
-const LAST_CALL =
-  process.env.CN_LAST_CALL ||
-  "Last call for delivery is 8:15 PM daily. Orders placed after that time, or from distant locations, may be scheduled for the next day.";
+/* =========================
+   ZIP RULES: LOAD FROM FILE
+   ========================= */
 
-const MED_PTS =
-  process.env.CN_MED_PATIENTS ||
-  "We also accept verified medical patients ages 18+ with a valid recommendation.";
+let ZIP_RULES = new Map(); // zip -> { min, fee }
+const DEFAULT_ZONE = { min: 80, fee: 1.99 };
 
-const PARKING =
-  process.env.CN_PARKING ||
-  "Plenty of street parking available right on J Street and 23rd — easy access to the shop!";
+const parseCsv = (raw) => {
+  // very light CSV parser (commas). Accepts headers.
+  const lines = raw.split(/\r?\n/).filter((l) => l.trim().length);
+  if (lines.length === 0) return [];
+  const header = lines[0].split(",").map((h) => h.trim().toLowerCase());
+  const rows = lines.slice(1).map((line) => {
+    const cols = line.split(",").map((c) => c.trim());
+    const obj = {};
+    header.forEach((h, i) => (obj[h] = cols[i]));
+    return obj;
+  });
+  return rows;
+};
 
-const PAYMENT =
-  process.env.CN_PAYMENT ||
-  "We accept cash and JanePay for both in-store and delivery orders. If you need cash, we’ve got two ATMs in-store.";
-
-const SPECIALS =
-  process.env.CN_SPECIALS ||
-  "To check out today’s deals, just visit crystalnugs.com — our daily specials appear automatically. Deals change every day.";
-
-const RETURNS =
-  process.env.CN_RETURN_POLICY ||
-  "Crystal Nugs may exchange most defective products within 24 hours of purchase when returned in original packaging with a valid receipt, per California DCC regulations.";
-
-const VENDOR_INFO =
-  process.env.CN_VENDOR_INFO ||
-  "Vendors and brands can email chris at crystal nugs dot com — that's C-H-R-I-S at crystal nugs dot com — with your catalog, best pricing, and what makes your brand stand out. Our purchasing team reviews submissions weekly.";
-
-const VENDOR_DEMO =
-  process.env.CN_VENDOR_DEMO ||
-  "If you’d like to schedule an in-store demo or brand activation at Crystal Nugs, please email our demo coordinator at caprice at crystal nugs dot com — that's C-A-P-R-I-C-E at crystal nugs dot com — with your preferred dates, time slots, and sample information. Our events team will confirm availability and handle compliance details.";
-
-const WEBSITE = process.env.CN_WEBSITE || "https://www.crystalnugs.com";
-
-const MAP_URL =
-  process.env.CN_DIRECTIONS_URL ||
-  "Crystal Nugs is at 2300 J Street in Midtown Sacramento — the neon green building on the corner of J and 23rd.";
-
-// ===== ZIP delivery table (JSON path via CN_ZIP_FILE or defaults to /data/zipzones.json) =====
-const ZIP_FILE = process.env.CN_ZIP_FILE || path.join(process.cwd(), "data", "zipzones.json");
-/**
- * ZIP_RULES: Map<zip, { fee:number, minimum:number, deliveryTime:string }>
- * deliveryTime is a human string like "Generally 1 hour to 2 hours"
- */
-let ZIP_RULES = new Map();
-try {
-  const raw = fs.readFileSync(ZIP_FILE, "utf8");
-  const items = JSON.parse(raw);
-  for (const r of items) {
-    if (!r?.zip) continue;
-    ZIP_RULES.set(String(r.zip), {
-      fee: Number(r.fee ?? 0),
-      minimum: Number(r.minimum ?? 0),
-      deliveryTime: String(r.deliveryTime ?? "")
-    });
+const normalizeHeaders = (obj) => {
+  // map various header spellings to {zipcode, min, fee}
+  const mapKey = (k) => (k || "").toLowerCase().replace(/\s+/g, "_");
+  const out = {};
+  for (const [k, v] of Object.entries(obj || {})) {
+    out[mapKey(k)] = v;
   }
-  console.log(`Loaded ${ZIP_RULES.size} ZIP rows from`, ZIP_FILE);
-} catch (e) {
-  console.warn("ZIP table not loaded:", e?.message || e);
+
+  const z =
+    out.zipcode ?? out.zip ?? out.postal_code ?? out.postcode ?? out.code ?? out["zip_code"];
+  const min =
+    out.delivery_minimum ??
+    out.minimum ??
+    out.min ??
+    out.min_order ??
+    out["delivery_min"] ??
+    out["min_delivery"];
+  const fee =
+    out.delivery_fee ?? out.fee ?? out["delivery_cost"] ?? out["service_fee"] ?? out["d_fee"];
+
+  return { zipcode: z, min, fee };
+};
+
+async function loadZipRulesFromFile(filePath) {
+  const abs = path.resolve(process.cwd(), filePath);
+  const raw = await fs.readFile(abs, "utf8");
+  const ext = path.extname(abs).toLowerCase();
+
+  const map = new Map();
+
+  if (ext === ".json") {
+    const data = JSON.parse(raw);
+    // Accept array of objects or object keyed by zip
+    if (Array.isArray(data)) {
+      for (const row of data) {
+        const { zipcode, min, fee } = normalizeHeaders(row);
+        const z = String(zipcode || "").replace(/\D/g, "");
+        if (!z) continue;
+        const m = parseFloat(min);
+        const f = parseFloat(fee);
+        if (!Number.isFinite(m) || !Number.isFinite(f)) continue;
+        map.set(z, { min: m, fee: f });
+      }
+    } else if (data && typeof data === "object") {
+      for (const [key, val] of Object.entries(data)) {
+        const z = String(key).replace(/\D/g, "");
+        if (!z) continue;
+        const obj = normalizeHeaders(val);
+        const m = parseFloat(obj.min);
+        const f = parseFloat(obj.fee);
+        if (!Number.isFinite(m) || !Number.isFinite(f)) continue;
+        map.set(z, { min: m, fee: f });
+      }
+    }
+  } else if (ext === ".csv") {
+    const rows = parseCsv(raw);
+    for (const row of rows) {
+      const { zipcode, min, fee } = normalizeHeaders(row);
+      const z = String(zipcode || "").replace(/\D/g, "");
+      if (!z) continue;
+      const m = parseFloat(min);
+      const f = parseFloat(fee);
+      if (!Number.isFinite(m) || !Number.isFinite(f)) continue;
+      map.set(z, { min: m, fee: f });
+    }
+  } else {
+    throw new Error(
+      `Unsupported CN_ZIP_DATA_PATH extension "${ext}". Use .json or .csv (got: ${abs}).`
+    );
+  }
+
+  if (map.size === 0) {
+    console.warn("ZIP rules file parsed but produced 0 rows. Using empty map.");
+  }
+
+  return map;
 }
 
-// ---------- Health ----------
-app.get("/health", (_req, res) => res.json({ ok: true }));
+async function bootZipRules() {
+  try {
+    ZIP_RULES = await loadZipRulesFromFile(CN_ZIP_DATA_PATH);
+    console.log(`Loaded ${ZIP_RULES.size} ZIP rules from ${CN_ZIP_DATA_PATH}`);
+  } catch (e) {
+    console.error("Failed to load ZIP rules:", e.message);
+    console.error("Continuing with empty map (DEFAULT_ZONE will apply).");
+    ZIP_RULES = new Map();
+  }
+}
 
-// ---------- Voice Webhook ----------
-app.post("/twilio/voice", (req, res) => {
-  const wsUrl = `wss://${req.get("host")}/relay`;
-  const greeting =
-    "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?";
+function getZoneInfo(zip) {
+  const z = String(zip).replace(/\D/g, "");
+  return ZIP_RULES.get(z) || DEFAULT_ZONE;
+}
 
-  // Google Wavenet (luxury concierge female)
-  const twiml =
-    `<Response>
-       <Connect>
-         <ConversationRelay
-           url="${wsUrl}"
-           ttsProvider="Google"
-           voice="en-US-Wavenet-F"
-           welcomeGreeting="${escapeXml(greeting)}" />
-       </Connect>
-     </Response>`;
+/* =========================
+   LOCAL INTENTS
+   ========================= */
+function buildDeliveryMinResponse(zip) {
+  const { min, fee } = getZoneInfo(zip);
+  const zipChunk = zipForVoice(zip);
+  const msg = `For zip code ${zipChunk}${beat()}the delivery minimum is $${min} and the delivery fee is $${fee.toFixed(
+    2
+  )}.`;
+  return sanitize(speak(msg));
+}
 
-  console.log("Serving /twilio/voice TwiML:\n", twiml);
-  res.type("text/xml").send(twiml);
+app.post("/intent/delivery-minimum", (req, res) => {
+  const zipcode = (req.body.zipcode || "").toString();
+  if (!zipcode) return res.status(400).json({ ok: false, error: "Missing zipcode" });
+  return res.json({
+    ok: true,
+    speech: buildDeliveryMinResponse(zipcode),
+    meta: { zipcode, USE_SSML },
+  });
 });
 
-// ---------- Optional transfer ----------
-app.post("/twilio/transfer", (_req, res) => {
+/* =========================
+   ADMIN: HOT RELOAD ZIPS
+   ========================= */
+app.post("/admin/reload-zips", async (req, res) => {
+  const auth = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  if (!ADMIN_TOKEN || auth !== ADMIN_TOKEN) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  try {
+    const fresh = await loadZipRulesFromFile(CN_ZIP_DATA_PATH);
+    ZIP_RULES = fresh;
+    return res.json({ ok: true, count: ZIP_RULES.size, file: CN_ZIP_DATA_PATH });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* =========================
+   OPENAI FALLBACK (OPTIONAL)
+   ========================= */
+async function openAiChat(messages, system = "You are a helpful Crystal Nugs assistant.") {
+  if (!OPENAI_API_KEY) return null;
+  try {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: OPENAI_CHAT_MODEL,
+        temperature: 0.3,
+        messages: [{ role: "system", content: system }, ...messages],
+      }),
+    });
+    const j = await r.json();
+    const content = j?.choices?.[0]?.message?.content || "";
+    return content;
+  } catch (e) {
+    console.error("OpenAI error:", e);
+    return null;
+  }
+}
+
+/* =========================
+   TWILIO WEBHOOKS (TwiML)
+   ========================= */
+const twilioClient =
+  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
+    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    : null;
+
+app.post("/twilio/voice", async (req, res) => {
   const vr = new twilio.twiml.VoiceResponse();
-  vr.say("No problem. Transferring you now.");
-  vr.dial(TRANSFER_NUMBER);
+  const welcome = sanitize(
+    speak(
+      `${BRAND}.${beat(100)} How can I help you today? If you need a person at any time, say "transfer".`
+    )
+  );
+
+  const connect = vr.connect();
+  connect
+    .conversationRelay({
+      url: TWILIO_WS_RELAY_URL,
+    })
+    .say({ voice: "Polly.Joanna-Neural" }, welcome);
+
   res.type("text/xml").send(vr.toString());
 });
 
-// ---------- Optional call status logs ----------
+app.post("/twilio/transfer", async (req, res) => {
+  const vr = new twilio.twiml.VoiceResponse();
+  const s = sanitize(speak(`No problem.${beat()}Transferring you now.`));
+  vr.say({ voice: "Polly.Joanna-Neural" }, s);
+  const dial = vr.dial({ callerId: req.body?.To || undefined });
+  dial.number(TRANSFER_NUMBER);
+  res.type("text/xml").send(vr.toString());
+});
+
 app.post("/twilio/status", (req, res) => {
-  console.log("Call status:", req.body?.CallStatus, req.body?.CallSid);
+  try {
+    console.log("Call status:", {
+      CallSid: req.body.CallSid,
+      CallStatus: req.body.CallStatus,
+      Direction: req.body.Direction,
+      From: req.body.From,
+      To: req.body.To,
+    });
+  } catch (e) {}
   res.sendStatus(200);
 });
 
-// ---------- Start HTTP ----------
-const server = app.listen(PORT, () => {
-  console.log("Server listening on port", PORT);
-});
+/* =========================
+   WEBSOCKET RELAY (AI Brain)
+   ========================= */
+const wss = new WebSocketServer({ noServer: true });
+const SESSIONS = new Map();
 
-server.on("upgrade", (req) => {
-  // Helps confirm Twilio is attempting a WS upgrade
-  console.log("HTTP upgrade (WS) ->", req.url);
-});
-
-// ---------- WebSocket Bridge ----------
-const wss = new WebSocketServer({ server, path: "/relay" });
-
-wss.on("error", (err) => {
-  console.error("WSS server error:", err?.message || err);
-});
-
-wss.on("connection", async (twilioWS) => {
-  console.log("Twilio connected to Conversation Relay (HTTPS Chat + local intents)");
-
-  twilioWS.on("message", async (buf) => {
-    let msg;
-    try {
-      msg = JSON.parse(buf.toString());
-    } catch {
-      return;
-    }
-
-    if (msg.type === "setup") return;
-
-    if (msg.type === "prompt" && msg.voicePrompt) {
-      const userText = (msg.voicePrompt || "").trim();
-      const lc = userText.toLowerCase();
-      console.log("Caller said:", userText);
-
-      // --- ZIP fast-path: when a 5-digit zip is present, answer immediately
-      const zipHit = extractZip(userText);
-      if (zipHit) {
-        const reply = zipReply(zipHit);
-        safeSend(twilioWS, { type: "text", token: brandVoice(reply), last: true });
-        return;
-      }
-      // If they mention delivery/fees/minimum but no zip found, prompt for zip
-      if (/\b(zip|zipcode|postal|deliver|delivery|fee|min(imum)?|order)\b/i.test(userText)) {
-        const ask = "Sure — what’s your zip code?";
-        safeSend(twilioWS, { type: "text", token: brandVoice(ask), last: true });
-        return;
-      }
-
-      // --- Local intents (fast path)
-      const local = handleLocalIntent(lc);
-      if (local) {
-        safeSend(twilioWS, { type: "text", token: brandVoice(local), last: true });
-        return;
-      }
-
-      // --- Fallbacks
-      if (!OPENAI_API_KEY) {
-        safeSend(twilioWS, {
-          type: "text",
-          token: brandVoice("Sorry, I’m having trouble connecting right now."),
-          last: true,
-        });
-        return;
-      }
-
-      // --- OpenAI fallback
-      try {
-        const answer = await askOpenAI(lc);
-        safeSend(twilioWS, { type: "text", token: brandVoice(answer), last: true });
-      } catch (e) {
-        console.error("OpenAI HTTPS error:", e.message);
-        safeSend(twilioWS, {
-          type: "text",
-          token: brandVoice("Sorry, our assistant is currently busy. Please call back shortly."),
-          last: true,
-        });
-      }
-    }
-
-    // Optional: If your Relay can send DTMF digits separately, uncomment this:
-    // if (msg.type === "digits" && /^\d{5}$/.test(msg.digits)) {
-    //   const reply = zipReply(msg.digits);
-    //   safeSend(twilioWS, { type: "text", token: brandVoice(reply), last: true });
-    //   return;
-    // }
-  });
-
-  twilioWS.on("error", (err) => {
-    console.error("Twilio WS error:", err?.message || err);
-  });
-
-  twilioWS.on("close", (code, reason) => {
-    console.log("Twilio WS closed:", code, reason?.toString());
-  });
-});
-
-// ---------- Local Intent Handler ----------
-function handleLocalIntent(q = "") {
-  if (/\bhour|open|close|when\b/.test(q)) return `${HOURS} ${LAST_CALL}`;
-  if (/\baddress|location|where|directions|how to get\b/.test(q)) return MAP_URL;
-  if (/\bwebsite|site|url|online|menu\b/.test(q)) return "You can visit us online at Crystal Nugs dot com.";
-  if (/\bid|identification|age|21\b/.test(q)) return `${ID_RULES} ${MED_PTS}`;
-  if (/\bdeliver|delivery|zone|area|minimum|fee|charge\b/.test(q)) return `${DELIVERY} ${DELIV_MIN} ${DELIV_FEE}`;
-  if (/\bparking|park\b/.test(q)) return PARKING;
-  if (/\bpay|payment|cash|card|debit|atm|jane ?pay\b/.test(q)) return PAYMENT;
-  if (/\bdeal|special|discount|offer|promotion|promo\b/.test(q)) return SPECIALS;
-  if (/\breturn|exchange|refund|defective|replace|swap\b/.test(q)) return RETURNS;
-  if (/\bvendor|brand|wholesale|distributor|buyer\b/.test(q)) return VENDOR_INFO;
-  if (/\bdemo|activation|in-?store|pop-?up|event\b/.test(q)) return VENDOR_DEMO;
-  return null;
-}
-
-// ---------- OpenAI Chat fallback ----------
-async function askOpenAI(userText) {
-  const systemPrompt = `
-You are the Crystal Nugs Sacramento AI voice assistant.
-Speak in a warm, concierge tone. Keep sentences short. Use natural pauses.
-Never read raw URLs. Say "Crystal Nugs dot com" instead of a link.
-If asked for a person, say “No problem, transferring you now.”
-If a caller asks about delivery minimums/fees without a zip code, ask: “Sure — what’s your zip code?”
-Store hours: ${HOURS}
-Address: ${ADDRESS}
-Website: ${toSpokenText(WEBSITE)}
-Delivery: ${DELIVERY}
-ID rules: ${ID_RULES}
-Payment: ${PAYMENT}
-Returns: ${RETURNS}
-  `;
-
-  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: OPENAI_CHAT_MODEL,
-      temperature: 0.4,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userText },
-      ],
-    }),
-  });
-
-  if (!resp.ok) {
-    const errText = await resp.text().catch(() => "");
-    throw new Error(`OpenAI ${resp.status} ${resp.statusText}: ${errText.slice(0, 500)}`);
-  }
-
-  const data = await resp.json().catch(() => null);
-  const answer = data?.choices?.[0]?.message?.content?.trim();
-  return answer || "Sorry, I didn’t catch that.";
-}
-
-// ---------- Utils ----------
-function safeSend(ws, obj) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+function wsSend(ws, obj) {
   try {
     ws.send(JSON.stringify(obj));
   } catch (e) {
-    console.error("WS send error:", e.message);
+    console.error("WS send error:", e);
   }
 }
 
-function escapeXml(str = "") {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
+async function handleUserText(ws, text) {
+  const t = text.trim().toLowerCase();
 
-/** Convert crystalnugs.com and house emails to friendly spoken phrases. */
-function toSpokenText(text = "") {
-  if (!text) return "";
-  let out = String(text);
-
-  // Normalize our site in all common forms
-  out = out.replace(/https?:\/\/(www\.)?crystalnugs\.com\/?/gi, "Crystal Nugs dot com");
-  out = out.replace(/\bwww\.crystalnugs\.com\b/gi, "Crystal Nugs dot com");
-  out = out.replace(/\bcrystalnugs\.com\b/gi, "Crystal Nugs dot com");
-
-  // Convert any *@crystalnugs.com email to "name at crystal nugs dot com"
-  out = out.replace(
-    /\b([a-z0-9._%+-]+)@crystalnugs\.com\b/gi,
-    (_m, user) => `${user} at crystal nugs dot com`
-  );
-
-  // Generic: remove protocol for any other links that might slip through
-  out = out.replace(/https?:\/\//gi, "");
-
-  return out;
-}
-
-/**
- * Brand voice preset (Energetic + Smart):
- * - Plain text mode: concise normalization only.
- * - SSML mode (CN_USE_SSML=true): medium-fast rate, +6% pitch, 240ms breaks,
- *   light emphasis on the first ~3 words per sentence.
- */
-function brandVoice(raw = "") {
-  const cleaned = toSpokenText(raw).trim();
-
-  if (!USE_SSML) {
-    return cleaned
-      .replace(/\s+/g, " ")
-      .replace(/\s-\s/g, " — ")
-      .replace(/:\s+/g, ": ")
-      .replace(/,{2,}/g, ",")
-      .replace(/\.\s*\./g, ".")
-      .replace(/\s{2,}/g, " ");
+  // detect ZIP mentions + delivery questions
+  const zipMatch = t.match(/\b(9\d{4}|8\d{4}|7\d{4}|6\d{4}|5\d{4})\b/);
+  if (zipMatch && /(delivery.*min|minimum|fee|deliver)/.test(t)) {
+    const zip = zipMatch[1];
+    const speech = buildDeliveryMinResponse(zip);
+    return wsSend(ws, { type: "assistant", modality: "speech", content: speech });
   }
 
-  // Split into sentence-like chunks for natural phrasing
-  const parts = cleaned
-    .split(/(?<=[\.\?!])\s+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  const ssmlBody = parts
-    .map((s) => emphasisLead(s, 3)) // emphasize first ~3 words for a lively start
-    .join('<break time="240ms"/>');
-
-  return `<speak>
-    <prosody rate="medium-fast" pitch="+6%" volume="medium">
-      ${ssmlBody}
-    </prosody>
-  </speak>`;
-}
-
-// Emphasize the first N words lightly; escape both lead and tail safely
-function emphasisLead(sentence = "", n = 3) {
-  const tokens = sentence.split(/\s+/).filter(Boolean);
-  const lead = tokens.slice(0, n).join(" ");
-  const tail = tokens.slice(n).join(" ");
-  const leadEsc = escapeSSML(lead);
-  const tailEsc = escapeSSML(tail);
-  return tail
-    ? `<emphasis level="moderate">${leadEsc}</emphasis> ${tailEsc}`
-    : `<emphasis level="moderate">${leadEsc}</emphasis>`;
-}
-
-function escapeSSML(str = "") {
-  // Minimal safe escaping for text nodes inside SSML
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-/** Extract a 5-digit ZIP from free text. */
-function extractZip(text = "") {
-  if (!text) return null;
-  const m = text.match(/\b(\d{5})\b/);
-  return m ? m[1] : null;
-}
-
-/** Build spoken reply using deliveryTime from the table. */
-function zipReply(zip) {
-  if (!ZIP_RULES.size) {
-    return "Our delivery table isn’t available right now. Please visit Crystal Nugs dot com for delivery details.";
-  }
-  const row = ZIP_RULES.get(String(zip));
-  if (!row) {
-    return `I didn’t find ${zip} in our delivery zones. You can still order for pickup at Crystal Nugs Sacramento, or check delivery coverage on Crystal Nugs dot com.`;
+  if (/transfer|human|agent|representative/.test(t)) {
+    const msg = sanitize(speak(`No problem.${beat()}Transferring you now.`));
+    return wsSend(ws, { type: "assistant", modality: "command", action: "transfer", content: msg });
   }
 
-  const fee = toMoney(row.fee);
-  const min = toMoney(row.minimum);
-  const when = row.deliveryTime || "Generally 1 hour to 2 hours";
+  if (/hour|open|close|closing|last call/.test(t)) {
+    const out = sanitize(speak(`${HOURS}`));
+    return wsSend(ws, { type: "assistant", modality: "speech", content: out });
+  }
 
-  // Keep it concise; SSML handles pacing & emphasis.
-  return `For ${zip}: delivery minimum is ${min}, the delivery fee is ${fee}. Delivery time is ${when}.`;
+  // fallback to OpenAI
+  const ai = await openAiChat([{ role: "user", content: text }], `You are the Crystal Nugs assistant.
+- Be concise and friendly.
+- If the user mentions a 5-digit number that looks like a ZIP and asks about delivery, respond with the delivery minimum and fee using the format rules:
+  * ZIP must be read as digits via <say-as interpret-as="digits"> if SSML is enabled (USE_SSML=${USE_SSML}).
+  * Otherwise render as "9-5-8-2-7".
+- If the user asks to transfer, reply with a short acknowledgment "Transferring you now." and the client will handle the transfer.`);
+
+  const fallback = ai || "I can help with delivery minimums, hours, and transfers.";
+  const safe = sanitize(USE_SSML ? speak(fallback) : fallback);
+  return wsSend(ws, { type: "assistant", modality: "speech", content: safe });
 }
 
-function toMoney(n) {
-  const v = Number(n || 0);
-  return v.toLocaleString("en-US", {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2
+wss.on("connection", (ws, req) => {
+  const id = Math.random().toString(36).slice(2);
+  SESSIONS.set(id, ws);
+  ws.on("message", async (data) => {
+    let msg = null;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch {
+      return handleUserText(ws, data.toString());
+    }
+
+    if (msg?.type === "user") {
+      return handleUserText(ws, String(msg.content || ""));
+    }
+
+    if (msg?.type === "system" && msg?.event === "start") {
+      return wsSend(ws, {
+        type: "assistant",
+        modality: "speech",
+        content: sanitize(speak(`Welcome to ${BRAND}.${beat()}How can I help?`)),
+      });
+    }
   });
-}
+
+  ws.on("close", () => {
+    SESSIONS.delete(id);
+  });
+});
+
+// HTTP→WS upgrade
+const server = app.listen(PORT, async () => {
+  await bootZipRules();
+  console.log(`Crystal Nugs Voice AI running on :${PORT}`);
+});
+
+server.on("upgrade", (request, socket, head) => {
+  const { url } = request;
+  if (url && url.startsWith("/ws/relay")) {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit("connection", ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+/* =========================
+   HEALTH + DIAGNOSTICS
+   ========================= */
+app.get("/health", (req, res) =>
+  res.json({ ok: true, service: "crystal-nugs-voice-ai", zips: ZIP_RULES.size })
+);
+
+app.get("/debug/zip/:zip", (req, res) => {
+  const { zip } = req.params;
+  res.json({
+    zip,
+    voice_format: sanitize(zipForVoice(zip)),
+    message: buildDeliveryMinResponse(zip),
+    ssml: USE_SSML,
+    zone: getZoneInfo(zip),
+    file: CN_ZIP_DATA_PATH,
+  });
+});
