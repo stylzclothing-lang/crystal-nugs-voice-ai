@@ -1,7 +1,9 @@
-// server.js — Crystal Nugs Voice AI (Conversation Relay + local ZIP intents)
-// Keeps your TwiML with <ConversationRelay ... welcomeGreeting="...">
-// Answers ZIP questions with JSON array: [{ zip, fee, minimum, deliveryTime }]
-// Loads ZIP rules from file (CN_ZIP_DATA_PATH) or URL (CN_ZIP_DATA_URL)
+// server.js — Crystal Nugs Voice AI (Conversation Relay compatible)
+// - TwiML with <ConversationRelay ... welcomeGreeting="...">
+// - WS handler that replies with: { type: "response", voiceResponse: "..." }
+// - ZIP data from local file (CN_ZIP_DATA_PATH) or URL (CN_ZIP_DATA_URL)
+// - Answers: minimum, fee, delivery time buckets; also hours/address/phone/site
+// - Hot reload: POST /admin/reload-zips  (Authorization: Bearer ADMIN_TOKEN)
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -18,31 +20,34 @@ app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
 /* -------------------------
-   ENV / CONFIG
+   ENV
 -------------------------- */
 const PORT = process.env.PORT || 8080;
 
-// TwiML (kept minimal: your welcomeGreeting lives in TwiML attributes)
+const APP_BASE_URL = (process.env.APP_BASE_URL || "").replace(/\/$/, "");
+const WS_RELAY_PUBLIC_URL =
+  process.env.WS_RELAY_PUBLIC_URL ||
+  (APP_BASE_URL ? APP_BASE_URL.replace(/^http/, "wss") + "/relay" : "");
+
 const TTS_PROVIDER = process.env.TWILIO_TTS_PROVIDER || "Google";
 const TTS_VOICE = process.env.TWILIO_TTS_VOICE || "en-US-Wavenet-F";
 const WELCOME_GREETING =
   process.env.CN_WELCOME ||
   'Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?';
 
-// Conversation Relay needs a publicly reachable WSS URL
-// If not provided, we try to guess from APP_BASE_URL
-const APP_BASE_URL = (process.env.APP_BASE_URL || "").replace(/\/$/, "");
-const WS_RELAY_PUBLIC_URL =
-  process.env.WS_RELAY_PUBLIC_URL ||
-  (APP_BASE_URL ? APP_BASE_URL.replace(/^http/, "wss") + "/relay" : "");
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 
-// Admin & data
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || ""; // for /admin/reload-zips
-const CN_ZIP_DATA_PATH = process.env.CN_ZIP_DATA_PATH || "./data/zip_rules.json";
-const CN_ZIP_DATA_URL = process.env.CN_ZIP_DATA_URL || ""; // e.g., https://your-bucket/zip_rules.json
+const CN_ZIP_DATA_PATH = process.env.CN_ZIP_DATA_PATH || "./data/zipzones.json";
+const CN_ZIP_DATA_URL = process.env.CN_ZIP_DATA_URL || "";
+
+// Business info fallbacks for non-zip intents
+const CN_HOURS = process.env.CN_HOURS || "We’re open daily; last call is ~90 minutes before close.";
+const CN_ADDRESS = process.env.CN_ADDRESS || "2300 J Street, Sacramento, CA 95816";
+const CN_PHONE = process.env.CN_PHONE || "+1 (916) 507-XXXX";
+const CN_WEBSITE = process.env.CN_WEBSITE || "crystalnugs.com";
 
 /* -------------------------
-   ZIP DATA (JSON/CSV)
+   ZIP DATA LOADING
 -------------------------- */
 let ZIP_TABLE = new Map(); // zip -> { min, fee, lead, lastCall }
 
@@ -66,26 +71,10 @@ const normHeaders = (row) => {
   const zipcode = o.zipcode ?? o.zip ?? o.postal_code ?? o.postcode ?? o.code ?? o.zip_code;
   const min = o.delivery_minimum ?? o.minimum ?? o.min ?? o.min_order ?? o.delivery_min;
   const fee = o.delivery_fee ?? o.fee ?? o.delivery_cost ?? o.service_fee;
-  const lead = o.lead_time ?? o.lead ?? o.eta ?? o.lead_minutes; // minutes (number)
-  const last = o.last_call ?? o.last_call_minutes;               // minutes (number)
+  const lead = o.lead_time ?? o.lead ?? o.eta ?? o.lead_minutes; // minutes
+  const last = o.last_call ?? o.last_call_minutes;
   return { zipcode, min, fee, lead, lastCall: last };
 };
-
-async function loadZipTableFromFile(filePath) {
-  const abs = path.resolve(process.cwd(), filePath);
-  const raw = await fs.readFile(abs, "utf8");
-  const ext = path.extname(abs).toLowerCase();
-  return parseZipTable(raw, ext);
-}
-
-async function loadZipTableFromUrl(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`Fetch ${url} failed: ${r.status}`);
-  const raw = await r.text();
-  // guess extension from URL
-  const ext = url.toLowerCase().includes(".csv") ? ".csv" : ".json";
-  return parseZipTable(raw, ext);
-}
 
 function parseZipTable(raw, ext) {
   const map = new Map();
@@ -119,19 +108,34 @@ function parseZipTable(raw, ext) {
       map.set(z, { min: m, fee: f, lead: ld, lastCall: lc });
     }
   } else {
-    throw new Error(`Unsupported data type "${ext}" (use .json or .csv)`);
+    throw new Error(`Unsupported data extension: ${ext} (use .json or .csv)`);
   }
   return map;
+}
+
+async function loadZipTableFromFile(filePath) {
+  const abs = path.resolve(process.cwd(), filePath);
+  const raw = await fs.readFile(abs, "utf8");
+  const ext = path.extname(abs).toLowerCase() || ".json";
+  return parseZipTable(raw, ext);
+}
+
+async function loadZipTableFromUrl(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Fetch failed ${r.status}`);
+  const raw = await r.text();
+  const ext = url.toLowerCase().includes(".csv") ? ".csv" : ".json";
+  return parseZipTable(raw, ext);
 }
 
 async function bootZipTable() {
   try {
     if (CN_ZIP_DATA_URL) {
       ZIP_TABLE = await loadZipTableFromUrl(CN_ZIP_DATA_URL);
-      console.log(`ZIP table loaded from URL (${CN_ZIP_DATA_URL}) — rows: ${ZIP_TABLE.size}`);
+      console.log(`ZIP table loaded from URL: ${CN_ZIP_DATA_URL} — rows: ${ZIP_TABLE.size}`);
     } else {
       ZIP_TABLE = await loadZipTableFromFile(CN_ZIP_DATA_PATH);
-      console.log(`ZIP table loaded from file (${CN_ZIP_DATA_PATH}) — rows: ${ZIP_TABLE.size}`);
+      console.log(`ZIP table loaded from file: ${CN_ZIP_DATA_PATH} — rows: ${ZIP_TABLE.size}`);
     }
   } catch (e) {
     console.error("Failed to load ZIP table:", e.message);
@@ -140,26 +144,18 @@ async function bootZipTable() {
 }
 
 /* -------------------------
-   DELIVERY TIME TEXT
+   DELIVERY TIME BUCKETS
 -------------------------- */
-// Map numeric lead to your friendly strings.
-// Tweak this mapping if you want different thresholds.
-function makeDeliveryTime(row) {
+function deliveryTimeText(row) {
   const lead = Number.isFinite(row?.lead) ? row.lead : null;
-
-  // Your requested phrasing buckets:
-  //  - 30–120 mins → "Generally 1 hour to 2 hours"
-  //  - 90–150 mins → "Generally 1 and a half hours to 2 and a half hours"
-  //  - 0 or unknown → "Generally 30 min to 2 hours"
   if (lead == null || lead === 0) return "Generally 30 min to 2 hours";
   if (lead <= 30) return "Generally 1 hour to 2 hours";
   if (lead >= 90) return "Generally 1 and a half hours to 2 and a half hours";
-  // mid-range default
   return "Generally 1 hour to 2 hours";
 }
 
 /* -------------------------
-   BUILD JSON RESPONSES
+   BUILD RESPONSES
 -------------------------- */
 function buildZipRecord(zip) {
   const z = String(zip).replace(/\D/g, "");
@@ -169,7 +165,7 @@ function buildZipRecord(zip) {
     zip: z,
     fee: Number(row.fee),
     minimum: Number(row.min),
-    deliveryTime: makeDeliveryTime(row),
+    deliveryTime: deliveryTimeText(row),
   };
 }
 
@@ -189,13 +185,10 @@ function buildZipArray(zips) {
 }
 
 /* -------------------------
-   TwiML: KEEPING YOUR STYLE
+   TwiML (Conversation Relay)
 -------------------------- */
-// Your Twilio webhook that serves TwiML using <ConversationRelay ... />
 app.post("/twilio/voice", (req, res) => {
-  // IMPORTANT: Conversation Relay requires WSS URL
   const relayUrl = WS_RELAY_PUBLIC_URL || "wss://crystal-nugs-voice-ai.onrender.com/relay";
-
   const twiml =
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<Response>` +
@@ -207,7 +200,6 @@ app.post("/twilio/voice", (req, res) => {
     `      welcomeGreeting="${escapeXml(WELCOME_GREETING)}" />` +
     `  </Connect>` +
     `</Response>`;
-
   res.type("text/xml").send(twiml);
 });
 
@@ -221,9 +213,8 @@ function escapeXml(s = "") {
 }
 
 /* -------------------------
-   JSON API (optional)
+   JSON API (batch zips)
 -------------------------- */
-// POST { "zips": ["94203","95610", ...] } → returns array of {zip,fee,minimum,deliveryTime}
 app.post("/intent/zip-batch", (req, res) => {
   const zips = Array.isArray(req.body?.zips) ? req.body.zips : [];
   if (!zips.length) return res.status(400).json({ ok: false, error: "Provide zips: string[]" });
@@ -233,7 +224,7 @@ app.post("/intent/zip-batch", (req, res) => {
 });
 
 /* -------------------------
-   ADMIN: HOT RELOAD
+   ADMIN: Hot reload data
 -------------------------- */
 app.post("/admin/reload-zips", async (req, res) => {
   const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
@@ -260,72 +251,111 @@ app.get("/health", (req, res) =>
 );
 
 /* -------------------------
-   WEBSOCKET: /relay  (PATCHED)
+   WEBSOCKET: Conversation Relay
+   INBOUND messages we've seen:
+     { "type":"setup", ... }
+     { "type":"prompt", "voicePrompt":"...", "lang":"en-US", "last":true }
+   OUTBOUND message REQUIRED shape:
+     { "type":"response", "voiceResponse":"<what to speak back>" }
 -------------------------- */
 const wss = new WebSocketServer({ noServer: true });
 
-function sendAssistant(ws, content) {
-  // Most Conversation Relay setups accept plain text. If your client expects JSON,
-  // wrap as needed. We'll send plain text by default.
-  const payload = typeof content === "string" ? content : JSON.stringify(content);
-  try { ws.send(payload); } catch (e) { console.error("WS send error:", e); }
+function sendVoice(ws, text) {
+  const payload = { type: "response", voiceResponse: String(text || "") };
+  try {
+    ws.send(JSON.stringify(payload));
+    console.log("[WS OUT]", payload);
+  } catch (e) {
+    console.error("WS send error:", e);
+  }
 }
 
-wss.on("connection", (ws, req) => {
+wss.on("connection", (ws) => {
   console.log("[WS] connected");
 
   ws.on("message", async (data) => {
-    // ---- DEBUG: log what we got
-    let raw = data.toString();
-    console.log("[WS IN]", raw.slice(0, 500));
+    const raw = data.toString();
+    console.log("[WS IN]", raw);
 
-    // Extract plain text from possible JSON envelopes
-    let text = "";
+    // Parse incoming (Relay sends JSON)
+    let msg = {};
     try {
-      const obj = JSON.parse(raw);
-      text = obj?.content || obj?.text || obj?.utterance || raw;
+      msg = JSON.parse(raw);
     } catch {
-      text = raw;
+      // If not JSON, ignore
+      return;
     }
-    const t = String(text || "").trim().toLowerCase();
 
-    // Collect all 5-digit zips
-    const zipMatches = t.match(/\b\d{5}\b/g) || [];
-    const asksDelivery =
-      /(delivery|deliver|minimum|min|fee|cost|lead ?time|eta|how long|time|timing)/.test(t);
+    if (msg.type === "setup") {
+      // optional: greet or log
+      return;
+    }
 
-    if (zipMatches.length && asksDelivery) {
-      const payload = buildZipArray(zipMatches);
-      if (payload.length) {
-        console.log("[WS OUT] zip payload", payload.slice(0, 3), payload.length, "items total");
-        // return EXACT JSON array you asked for
-        sendAssistant(ws, payload);
-        return; // handled
+    if (msg.type === "prompt") {
+      const text = String(msg.voicePrompt || "").trim();
+      const t = text.toLowerCase();
+
+      // find any 5-digit zips
+      const zips = t.match(/\b\d{5}\b/g) || [];
+      const asksDelivery =
+        /(delivery|deliver|minimum|min|fee|cost|lead ?time|eta|how long|time|timing)/.test(t);
+
+      if (zips.length && asksDelivery) {
+        const arr = buildZipArray(zips);
+        if (arr.length) {
+          // Build a human-friendly spoken line
+          if (arr.length === 1) {
+            const r = arr[0];
+            const spokenZip = r.zip.split("").join(" ");
+            sendVoice(
+              `For zip code ${spokenZip}, the delivery minimum is $${r.minimum}, the delivery fee is $${r.fee.toFixed(
+                2
+              )}. ${r.deliveryTime}.`
+            );
+          } else {
+            // summarize first few and count
+            const first = arr.slice(0, 3).map((r) => `${r.zip}: $${r.minimum} min, $${r.fee.toFixed(2)} fee`).join("; ");
+            sendVoice(
+              `I found ${arr.length} zip codes. ${first}. If you want all details, I can text you a link.`
+            );
+          }
+          return;
+        } else {
+          sendVoice("I couldn't find that delivery zone. Try another zip code.");
+          return;
+        }
       }
+
+      // Common non-zip intents
+      if (/\bhour|open|close|closing|last call\b/.test(t)) {
+        sendVoice(CN_HOURS);
+        return;
+      }
+      if (/\baddress|location|where\b/.test(t)) {
+        sendVoice(CN_ADDRESS);
+        return;
+      }
+      if (/\bphone|call|number\b/.test(t)) {
+        sendVoice(`Our phone number is ${CN_PHONE}.`);
+        return;
+      }
+      if (/\bwebsite|site|url\b/.test(t)) {
+        sendVoice(`Our website is ${CN_WEBSITE}.`);
+        return;
+      }
+
+      // fallback so we never stay silent
+      sendVoice(
+        "I can help with delivery minimums, fees, and timing for any zip code. Try saying, delivery minimum for nine five eight two seven."
+      );
+      return;
     }
 
-    // ---- Other popular intents (optional quick answers using your envs)
-    if (/\bhour|open|close|closing|last call\b/.test(t)) {
-      sendAssistant(ws, process.env.CN_HOURS || "We’re open daily; last call about 90 minutes before close.");
+    if (msg.type === "error") {
+      console.warn("[WS ERROR from Relay]", msg.description);
+      // no response needed
       return;
     }
-    if (/\baddress|location|where\b/.test(t)) {
-      sendAssistant(ws, process.env.CN_ADDRESS || "Our Sacramento location address is on file.");
-      return;
-    }
-    if (/\bphone|call|number\b/.test(t)) {
-      sendAssistant(ws, process.env.CN_PHONE || "Our phone number is on file.");
-      return;
-    }
-    if (/\bwebsite|site|url\b/.test(t)) {
-      sendAssistant(ws, process.env.CN_WEBSITE || "Our website is on file.");
-      return;
-    }
-
-    // ---- SAFE FALLBACK so it never stays silent
-    sendAssistant(
-      "I can help with delivery minimums, fees, and timing for any zip code. Try: “delivery minimum for 95827”. I can also answer hours, address, directions, payment, and more."
-    );
   });
 
   ws.on("close", (code, reason) => {
@@ -333,18 +363,18 @@ wss.on("connection", (ws, req) => {
   });
 });
 
-
 /* -------------------------
-   HTTP → WS Upgrade
+   HTTP → WS upgrade
 -------------------------- */
 const server = app.listen(PORT, async () => {
   await bootZipTable();
-  console.log(`Crystal Nugs Voice AI listening on :${PORT}`);
-  console.log(`Conversation Relay WS: ${WS_RELAY_PUBLIC_URL || "(set WS_RELAY_PUBLIC_URL)"}`);
+  console.log(`Server :${PORT}`);
+  console.log(`Relay WS public URL: ${WS_RELAY_PUBLIC_URL || "(set WS_RELAY_PUBLIC_URL)"}`);
 });
 
 server.on("upgrade", (request, socket, head) => {
-  if (new URL(request.url, "http://localhost").pathname === "/relay") {
+  const url = new URL(request.url, "http://localhost");
+  if (url.pathname === "/relay") {
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit("connection", ws, request);
     });
