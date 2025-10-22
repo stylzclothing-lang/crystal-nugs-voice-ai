@@ -1,8 +1,9 @@
-// server.js — ESM build (type: module)
+// server.js — Crystal Nugs Voice AI (ESM, Twilio ConversationRelay compatible)
 // - TwiML with <ConversationRelay ... welcomeGreeting="...">
-// - WS: auto-negotiates outbound payload shape to avoid 64107
-// - Loads ZIP data from local JSON (CN_ZIP_DATA_PATH)
-// - Answers ZIP min/fee/time; plus hours/address/phone/site; fallback
+// - WebSocket replies as: { type: "text", token: "...", last: true }
+// - ZIP data from local JSON (CN_ZIP_DATA_PATH, e.g., ./data/zipzones.json)
+// - Answers: delivery minimum/fee/timing; hours/address/phone/website; safe fallback
+// - Admin: POST /admin/reload-zips  (Authorization: Bearer ADMIN_TOKEN)
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -12,6 +13,9 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 
+/* =========================
+   Setup
+========================= */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -24,11 +28,13 @@ app.use(bodyParser.json());
 ========================= */
 const PORT = process.env.PORT || 8080;
 
+// Public base and relay URL (keep your existing greeting flow)
 const APP_BASE_URL = (process.env.APP_BASE_URL || "").replace(/\/$/, "");
 const WS_RELAY_PUBLIC_URL =
   process.env.WS_RELAY_PUBLIC_URL ||
   (APP_BASE_URL ? APP_BASE_URL.replace(/^http/, "wss") + "/relay" : "");
 
+// TTS for TwiML attributes (Relay handles actual speaking)
 const TTS_PROVIDER = process.env.TWILIO_TTS_PROVIDER || "Google";
 const TTS_VOICE = process.env.TWILIO_TTS_VOICE || "en-US-Wavenet-F";
 const WELCOME_GREETING =
@@ -36,9 +42,11 @@ const WELCOME_GREETING =
   'Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?';
 
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+
+// Local ZIP data file path (in your repo: ./data/zipzones.json)
 const CN_ZIP_DATA_PATH = process.env.CN_ZIP_DATA_PATH || "./data/zipzones.json";
 
-// Non-zip quick answers (your existing envs still work)
+// Common info (these can already be set in your env)
 const CN_HOURS = process.env.CN_HOURS || "We’re open daily; last call is ~90 minutes before close.";
 const CN_ADDRESS = process.env.CN_ADDRESS || "2300 J Street, Sacramento, CA 95816";
 const CN_PHONE = process.env.CN_PHONE || "+1 (916) 507-XXXX";
@@ -50,6 +58,7 @@ const CN_WEBSITE = process.env.CN_WEBSITE || "crystalnugs.com";
 let ZIP_TABLE = new Map(); // zip -> { min, fee, lead, lastCall }
 
 function normalizeRow(row) {
+  // normalize keys to snake_case
   const nk = (k) => (k || "").toLowerCase().replace(/\s+/g, "_");
   const o = {};
   Object.entries(row || {}).forEach(([k, v]) => (o[nk(k)] = v));
@@ -66,9 +75,8 @@ async function bootZipTable() {
   try {
     const abs = path.resolve(__dirname, CN_ZIP_DATA_PATH);
     const raw = await fs.readFile(abs, "utf8");
-
     const ext = path.extname(abs).toLowerCase() || ".json";
-    if (ext !== ".json") throw new Error(`Only .json supported here. Got: ${ext}`);
+    if (ext !== ".json") throw new Error(`Only .json is supported for CN_ZIP_DATA_PATH (got ${ext})`);
 
     const data = JSON.parse(raw);
     const rows = Array.isArray(data)
@@ -97,7 +105,7 @@ async function bootZipTable() {
 }
 
 /* =========================
-   DELIVERY TIME TEXT
+   Helpers
 ========================= */
 function deliveryTimeText(row) {
   const lead = Number.isFinite(row?.lead) ? row.lead : null;
@@ -107,9 +115,6 @@ function deliveryTimeText(row) {
   return "Generally 1 hour to 2 hours";
 }
 
-/* =========================
-   BUILD RESPONSES
-========================= */
 function buildZipRecord(zip) {
   const z = String(zip).replace(/\D/g, "");
   const row = ZIP_TABLE.get(z);
@@ -132,6 +137,10 @@ function buildZipArray(zips) {
     if (rec) { out.push(rec); seen.add(z); }
   }
   return out;
+}
+
+function hyphenatedZip(zip) {
+  return String(zip).split("").join("-");
 }
 
 /* =========================
@@ -197,53 +206,21 @@ app.get("/health", (req, res) =>
 );
 
 /* =========================
-   WEBSOCKET + AUTO SCHEMA
+   WEBSOCKET (Conversation Relay)
 ========================= */
-// Outbound formats to try (ordered). We’ll bump on 64107 and resend.
-const SCHEMAS = [
-  (text) => ({ type: "response", voiceResponse: text }),
-  (text) => ({ type: "assistant", content: text }),
-  (text) => ({ type: "message", message: text }),
-  (text) => ({ type: "say", text }),
-  (text) => ({ response: text }),
-  (text) => ({ type: "response", text }),
-  (text) => ({ type: "response", voice_response: text }),
-  (text) => ({ speech: text }),
-  (text) => text // plain string
-];
-
+// Twilio Conversation Relay expects outbound "speak" messages as:
+//   { type: "text", token: "...", last: true }
 const wss = new WebSocketServer({ noServer: true });
 
-function connState(socket) {
-  if (!socket._state) socket._state = { schemaIndex: 0, lastText: "" };
-  return socket._state;
-}
-
-function trySend(socket, text, isRetry = false) {
-  const state = connState(socket);
-  state.lastText = text;
-
-  const build = SCHEMAS[state.schemaIndex] || SCHEMAS[0];
-  const payload = build(String(text || ""));
-  const wire = typeof payload === "string" ? payload : JSON.stringify(payload);
-
+function say(socket, text, { last = true, lang } = {}) {
+  const payload = { type: "text", token: String(text ?? ""), last: Boolean(last) };
+  if (lang) payload.lang = lang; // optional
   try {
-    if (typeof socket.send === "function") {
-      socket.send(wire);
-      console.log("[WS OUT]", typeof payload === "string" ? payload : payload);
-    } else {
-      console.error("trySend: socket.send is not a function");
-    }
+    socket.send(JSON.stringify(payload));
+    console.log("[WS OUT]", payload);
   } catch (e) {
     console.error("WS send error:", e);
   }
-}
-
-function bumpSchemaAndResend(socket) {
-  const state = connState(socket);
-  state.schemaIndex = Math.min(state.schemaIndex + 1, SCHEMAS.length - 1);
-  console.warn("[SCHEMA] Bumping to index", state.schemaIndex);
-  if (state.lastText) trySend(socket, state.lastText, true);
 }
 
 wss.on("connection", (socket) => {
@@ -258,19 +235,11 @@ wss.on("connection", (socket) => {
 
     if (msg.type === "setup") return;
 
-    if (msg.type === "error") {
-      const desc = String(msg.description || "");
-      if (desc.includes("Invalid message") || desc.includes("64107")) {
-        bumpSchemaAndResend(socket);
-      }
-      return;
-    }
-
     if (msg.type === "prompt") {
       const text = String(msg.voicePrompt || "").trim();
       const t = text.toLowerCase();
 
-      // ZIP intent
+      // Delivery / ZIP intent
       const zips = t.match(/\b\d{5}\b/g) || [];
       const asksDelivery =
         /(delivery|deliver|minimum|min|fee|cost|lead ?time|eta|how long|time|timing)/.test(t);
@@ -280,8 +249,8 @@ wss.on("connection", (socket) => {
         if (arr.length) {
           if (arr.length === 1) {
             const r = arr[0];
-            const spokenZip = r.zip.split("").join(" ");
-            trySend(
+            const spokenZip = hyphenatedZip(r.zip); // "9-5-8-2-7"
+            say(
               socket,
               `For zip code ${spokenZip}, the delivery minimum is $${r.minimum}, the delivery fee is $${r.fee.toFixed(
                 2
@@ -292,38 +261,44 @@ wss.on("connection", (socket) => {
               .slice(0, 3)
               .map((r) => `${r.zip}: $${r.minimum} min, $${r.fee.toFixed(2)} fee`)
               .join("; ");
-            trySend(socket, `I found ${arr.length} zip codes. ${first}.`);
+            say(socket, `I found ${arr.length} zip codes. ${first}.`);
           }
           return;
         } else {
-          trySend(socket, "I couldn't find that delivery zone. Try another zip code.");
+          say(socket, "I couldn't find that delivery zone. Try another zip code.");
           return;
         }
       }
 
-      // Hours / Address / Phone / Website
+      // Hours / Address / Phone / Website quick intents
       if (/\bhour|open|close|closing|last call\b/.test(t)) {
-        trySend(socket, CN_HOURS);
+        say(socket, CN_HOURS);
         return;
       }
       if (/\baddress|location|where\b/.test(t)) {
-        trySend(socket, CN_ADDRESS);
+        say(socket, CN_ADDRESS);
         return;
       }
       if (/\bphone|call|number\b/.test(t)) {
-        trySend(socket, `Our phone number is ${CN_PHONE}.`);
+        say(socket, `Our phone number is ${CN_PHONE}.`);
         return;
       }
       if (/\bwebsite|site|url\b/.test(t)) {
-        trySend(socket, `Our website is ${CN_WEBSITE}.`);
+        say(socket, `Our website is ${CN_WEBSITE}.`);
         return;
       }
 
-      // Fallback
-      trySend(
+      // Fallback — never silent
+      say(
         socket,
         "I can help with delivery minimums, fees, and timing for any zip code. Try saying, delivery minimum for nine five eight two seven."
       );
+      return;
+    }
+
+    if (msg.type === "error") {
+      // Relay internal notices (we don't need to answer here)
+      console.warn("[WS ERROR from Relay]", msg.description);
       return;
     }
   });
@@ -334,7 +309,7 @@ wss.on("connection", (socket) => {
 });
 
 /* =========================
-   HTTP → WS UPGRADE
+   HTTP → WS upgrade
 ========================= */
 const server = app.listen(PORT, async () => {
   await bootZipTable();
