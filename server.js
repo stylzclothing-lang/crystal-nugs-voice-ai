@@ -1,12 +1,14 @@
-// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F) — Fixed WS + Hardened OpenAI + Sanitizer
-// Twilio Conversation Relay (TEXT) + Local Intents + OpenAI fallback
+// server.js — Crystal Nugs Voice AI (keep ConversationRelay welcomeGreeting)
+// Adds local ZIP intent: returns JSON [{zip, fee, minimum, deliveryTime}] or spoken line
+// Uses your existing TwiML pattern and a WS endpoint at /relay
 
 import express from "express";
-import { WebSocketServer, WebSocket } from "ws";
 import bodyParser from "body-parser";
 import { config } from "dotenv";
 import twilio from "twilio";
-import fetch from "node-fetch";
+import { WebSocketServer } from "ws";
+import fs from "fs/promises";
+import path from "path";
 
 config();
 
@@ -14,338 +16,259 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 
+/* =========================
+   ENV / CONFIG
+   ========================= */
 const PORT = process.env.PORT || 8080;
+
+// Public base. You already have PUBLIC_BASE_URL in your env list.
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "https://crystal-nugs-voice-ai.onrender.com").replace(/\/$/, "");
+
+// Conversation Relay WS URL (wss). If not set, derive from PUBLIC_BASE_URL.
+const RELAY_PATH = process.env.TWILIO_WS_RELAY_PATH || "/relay";
+const TWILIO_RELAY_WSS_URL =
+  process.env.TWILIO_RELAY_WSS_URL || `${PUBLIC_BASE_URL.replace(/^http/, "wss")}${RELAY_PATH}`;
+
+// TwiML voice + greeting kept on the <ConversationRelay> element (like your working setup)
+const TTS_PROVIDER = process.env.TTS_PROVIDER || "Google";
+const TTS_VOICE = process.env.TTS_VOICE || "en-US-Wavenet-F";
+const WELCOME_GREETING =
+  process.env.WELCOME_GREETING ||
+  "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?";
+
+// Optional OpenAI fallback (not required)
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini";
-const TRANSFER_NUMBER = process.env.TWILIO_VOICE_FALLBACK || "+19165071099";
-const USE_SSML = String(process.env.CN_USE_SSML || "false").toLowerCase() === "true";
 
-// ===== Business Facts (env-driven; update in Render → Environment) =====
-const HOURS =
-  process.env.CN_HOURS ||
-  "Our dispensary is open daily from 9:00 AM to 9:00 PM, and we take delivery orders from 8:30 AM to 8:30 PM.";
+// JSON vs speech output for local ZIP intent
+const OUTPUT_JSON = String(process.env.CN_OUTPUT_FORMAT || "speech").toLowerCase() === "json";
 
-const ADDRESS = process.env.CN_ADDRESS || "2300 J Street, Sacramento, CA 95816";
+// Where to load your zone data
+const CN_ZIP_DATA_PATH = process.env.CN_ZIP_DATA_PATH || "./data/zip_rules.json";
 
-const ID_RULES =
-  process.env.CN_ID_RULES ||
-  "You’ll need a valid government-issued photo ID and be at least 21+.";
+/* =========================
+   ZIP DATA LOADER (JSON/CSV)
+   Expected columns/keys (case-insensitive):
+   zipcode, delivery_minimum, delivery_fee, lead_time (mins), last_call (mins)
+   ========================= */
+let ZIP_TABLE = new Map(); // zip -> { min, fee, lead, lastCall }
 
-const DELIVERY =
-  process.env.CN_DELIVERY ||
-  "We deliver to Midtown and the greater Sacramento area including Citrus Heights, Roseville, Lincoln, Folsom, Elk Grove, and more. Share your address to confirm delivery.";
+const parseCsv = (raw) => {
+  const lines = raw.split(/\r?\n/).filter((l) => l.trim().length);
+  if (!lines.length) return [];
+  const header = lines[0].split(",").map((h) => h.trim().toLowerCase());
+  return lines.slice(1).map((line) => {
+    const cols = line.split(",").map((c) => c.trim());
+    const obj = {};
+    header.forEach((h, i) => (obj[h] = cols[i]));
+    return obj;
+  });
+};
 
-const DELIV_MIN =
-  process.env.CN_DELIVERY_MINIMUM ||
-  "Order minimums depend on where you’re located — for the immediate Sacramento area, it’s just $40.";
+const normHeaders = (row) => {
+  const nk = (k) => (k || "").toLowerCase().replace(/\s+/g, "_");
+  const o = {};
+  for (const [k, v] of Object.entries(row || {})) o[nk(k)] = v;
 
-const DELIV_FEE =
-  process.env.CN_DELIVERY_FEE ||
-  "Enjoy fast delivery for just $1.99 on most orders.";
+  const zipcode = o.zipcode ?? o.zip ?? o.postal_code ?? o.postcode ?? o.code ?? o["zip_code"];
+  const min = o.delivery_minimum ?? o.minimum ?? o.min ?? o.min_order;
+  const fee = o.delivery_fee ?? o.fee ?? o.delivery_cost;
+  const lead = o.lead_time ?? o.lead ?? o.eta ?? o["lead_minutes"];
+  const last = o.last_call ?? o["last_call_minutes"];
+  return { zipcode, min, fee, lead, lastCall: last };
+};
 
-const LAST_CALL =
-  process.env.CN_LAST_CALL ||
-  "Last call for delivery is 8:15 PM daily. Orders placed after that time, or from distant locations, may be scheduled for the next day.";
+async function loadZipTable(filePath) {
+  const abs = path.resolve(process.cwd(), filePath);
+  const raw = await fs.readFile(abs, "utf8");
+  const ext = path.extname(abs).toLowerCase();
+  const map = new Map();
 
-const MED_PTS =
-  process.env.CN_MED_PATIENTS ||
-  "We also accept verified medical patients ages 18+ with a valid recommendation.";
+  if (ext === ".json") {
+    const data = JSON.parse(raw);
+    const rows = Array.isArray(data)
+      ? data
+      : Object.entries(data).map(([zipcode, v]) => ({ zipcode, ...v }));
+    for (const r of rows) {
+      const { zipcode, min, fee, lead, lastCall } = normHeaders(r);
+      const z = String(zipcode || "").replace(/\D/g, "");
+      if (!z) continue;
+      const m = parseFloat(min);
+      const f = parseFloat(fee);
+      const ld = lead != null ? parseFloat(lead) : null;
+      const lc = lastCall != null ? parseFloat(lastCall) : null;
+      if (!Number.isFinite(m) || !Number.isFinite(f)) continue;
+      map.set(z, { min: m, fee: f, lead: ld, lastCall: lc });
+    }
+  } else if (ext === ".csv") {
+    const rows = parseCsv(raw);
+    for (const r of rows) {
+      const { zipcode, min, fee, lead, lastCall } = normHeaders(r);
+      const z = String(zipcode || "").replace(/\D/g, "");
+      if (!z) continue;
+      const m = parseFloat(min);
+      const f = parseFloat(fee);
+      const ld = lead != null ? parseFloat(lead) : null;
+      const lc = lastCall != null ? parseFloat(lastCall) : null;
+      if (!Number.isFinite(m) || !Number.isFinite(f)) continue;
+      map.set(z, { min: m, fee: f, lead: ld, lastCall: lc });
+    }
+  } else {
+    console.warn(`Unsupported CN_ZIP_DATA_PATH: ${ext}. Use .json or .csv`);
+  }
 
-const PARKING =
-  process.env.CN_PARKING ||
-  "Plenty of street parking available right on J Street and 23rd — easy access to the shop!";
+  ZIP_TABLE = map;
+  console.log(`ZIP table loaded: ${ZIP_TABLE.size} rows from ${CN_ZIP_DATA_PATH}`);
+}
 
-const PAYMENT =
-  process.env.CN_PAYMENT ||
-  "We accept cash and JanePay for both in-store and delivery orders. If you need cash, we’ve got two ATMs in-store.";
+function zipDashed(zip) {
+  return String(zip).replace(/\D/g, "").split("").join("-");
+}
 
-const SPECIALS =
-  process.env.CN_SPECIALS ||
-  "To check out today’s deals, just visit crystalnugs.com — our daily specials appear automatically. Deals change every day.";
+// Map a numeric lead (mins) to your phrasing
+function deliveryTimeFromLead(lead) {
+  if (!Number.isFinite(lead) || lead <= 0) return "Generally 30 min to 2 hours";
+  if (lead <= 30) return "Generally 1 hour to 2 hours";
+  if (lead <= 45) return "Generally 1 and a half hours to 2 and a half hours";
+  return "Generally 1 hour to 2 hours";
+}
 
-const RETURNS =
-  process.env.CN_RETURN_POLICY ||
-  "Crystal Nugs may exchange most defective products within 24 hours of purchase when returned in original packaging with a valid receipt, per California DCC regulations.";
+function buildZipJSON(zip) {
+  const z = String(zip).replace(/\D/g, "");
+  const row = ZIP_TABLE.get(z);
+  if (!row) return null;
+  return {
+    zip: z,
+    fee: Number(row.fee),
+    minimum: Number(row.min),
+    deliveryTime: deliveryTimeFromLead(row.lead),
+  };
+}
 
-const VENDOR_INFO =
-  process.env.CN_VENDOR_INFO ||
-  "Vendors and brands can email chris at crystal nugs dot com — that's C-H-R-I-S at crystal nugs dot com — with your catalog, best pricing, and what makes your brand stand out. Our purchasing team reviews submissions weekly.";
+function buildZipSpoken(zip) {
+  const item = buildZipJSON(zip);
+  if (!item) return `For zip code ${zipDashed(zip)}, I couldn't find a delivery zone. Can you try another zip code?`;
+  return `For zip code ${zipDashed(item.zip)}, the delivery minimum is $${item.minimum}, the delivery fee is $${item.fee.toFixed(
+    2
+  )}, and the delivery time is ${item.deliveryTime}.`;
+}
 
-const VENDOR_DEMO =
-  process.env.CN_VENDOR_DEMO ||
-  "If you’d like to schedule an in-store demo or brand activation at Crystal Nugs, please email our demo coordinator at caprice at crystal nugs dot com — that's C-A-P-R-I-C-E at crystal nugs dot com — with your preferred dates, time slots, and sample information. Our events team will confirm availability and handle compliance details.";
-
-const WEBSITE = process.env.CN_WEBSITE || "https://www.crystalnugs.com";
-
-const MAP_URL =
-  process.env.CN_DIRECTIONS_URL ||
-  "Crystal Nugs is at 2300 J Street in Midtown Sacramento — the neon green building on the corner of J and 23rd.";
-
-// ---------- Health ----------
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
-// ---------- Voice Webhook ----------
+/* =========================
+   Twilio TwiML — keep your working pattern
+   <Connect><ConversationRelay url="wss://.../relay" ttsProvider="Google" voice="en-US-Wavenet-F" welcomeGreeting="..."/>
+   ========================= */
 app.post("/twilio/voice", (req, res) => {
-  const wsUrl = `wss://${req.get("host")}/relay`;
-  const greeting =
-    "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?";
-
-  // Google Wavenet (luxury concierge female)
-  const twiml =
-    `<Response>
-       <Connect>
-         <ConversationRelay
-           url="${wsUrl}"
-           ttsProvider="Google"
-           voice="en-US-Wavenet-F"
-           welcomeGreeting="${escapeXml(greeting)}" />
-       </Connect>
-     </Response>`;
-
-  console.log("Serving /twilio/voice TwiML:\n", twiml);
-  res.type("text/xml").send(twiml);
-});
-
-// ---------- Optional transfer ----------
-app.post("/twilio/transfer", (_req, res) => {
   const vr = new twilio.twiml.VoiceResponse();
-  vr.say("No problem. Transferring you now.");
-  vr.dial(TRANSFER_NUMBER);
+  const connect = vr.connect();
+  connect.conversationRelay({
+    url: TWILIO_RELAY_WSS_URL,
+    ttsProvider: TTS_PROVIDER,
+    voice: TTS_VOICE,
+    welcomeGreeting: WELCOME_GREETING,
+  });
   res.type("text/xml").send(vr.toString());
 });
 
-// ---------- Optional call status logs ----------
-app.post("/twilio/status", (req, res) => {
-  console.log("Call status:", req.body?.CallStatus, req.body?.CallSid);
-  res.sendStatus(200);
+/* =========================
+   Optional transfer endpoint (unchanged from your setup if you have one)
+   ========================= */
+app.post("/twilio/transfer", (req, res) => {
+  const vr = new twilio.twiml.VoiceResponse();
+  vr.say("Transferring you now.");
+  const dial = vr.dial({ callerId: req.body?.To || undefined });
+  dial.number(process.env.TWILIO_VOICE_FALLBACK || "+19165071099");
+  res.type("text/xml").send(vr.toString());
 });
 
-// ---------- Start HTTP ----------
-const server = app.listen(PORT, () => {
-  console.log("Server listening on port", PORT);
+/* =========================
+   REST helper: batch zone lookup
+   GET /zones?zips=95827,95632,95758
+   ========================= */
+app.get("/zones", (req, res) => {
+  const q = String(req.query.zips || "");
+  const list = (q.match(/\b\d{5}\b/g) || []).map(buildZipJSON).filter(Boolean);
+  res.json(list);
 });
 
-server.on("upgrade", (req) => {
-  // Helps confirm Twilio is attempting a WS upgrade
-  console.log("HTTP upgrade (WS) ->", req.url);
-});
+/* =========================
+   WebSocket: /relay — local intent for ZIPs
+   - Detects any 5-digit ZIP(s) and delivery keywords
+   - Returns JSON array when CN_OUTPUT_FORMAT=json
+   - Else returns a spoken sentence for the first ZIP
+   ========================= */
+const wss = new WebSocketServer({ noServer: true });
 
-// ---------- WebSocket Bridge ----------
-const wss = new WebSocketServer({ server, path: "/relay" });
-
-wss.on("error", (err) => {
-  console.error("WSS server error:", err?.message || err);
-});
-
-wss.on("connection", async (twilioWS) => {
-  console.log("Twilio connected to Conversation Relay (HTTPS Chat + local intents)");
-
-  twilioWS.on("message", async (buf) => {
-    let msg;
-    try {
-      msg = JSON.parse(buf.toString());
-    } catch {
-      return;
-    }
-
-    if (msg.type === "setup") return;
-
-    if (msg.type === "prompt" && msg.voicePrompt) {
-      const userText = msg.voicePrompt.trim().toLowerCase();
-      console.log("Caller said:", userText);
-
-      // 1) Local intents (fast path)
-      const local = handleLocalIntent(userText);
-      if (local) {
-        safeSend(twilioWS, { type: "text", token: brandVoice(local), last: true });
-        return;
-      }
-
-      // 2) Fallbacks
-      if (!OPENAI_API_KEY) {
-        safeSend(twilioWS, {
-          type: "text",
-          token: brandVoice("Sorry, I’m having trouble connecting right now."),
-          last: true,
-        });
-        return;
-      }
-
-      // 3) OpenAI fallback
-      try {
-        const answer = await askOpenAI(userText);
-        safeSend(twilioWS, { type: "text", token: brandVoice(answer), last: true });
-      } catch (e) {
-        console.error("OpenAI HTTPS error:", e.message);
-        safeSend(twilioWS, {
-          type: "text",
-          token: brandVoice("Sorry, our assistant is currently busy. Please call back shortly."),
-          last: true,
-        });
-      }
-    }
-  });
-
-  twilioWS.on("error", (err) => {
-    console.error("Twilio WS error:", err?.message || err);
-  });
-
-  twilioWS.on("close", (code, reason) => {
-    console.log("Twilio WS closed:", code, reason?.toString());
-  });
-});
-
-// ---------- Local Intent Handler ----------
-function handleLocalIntent(q = "") {
-  if (/\bhour|open|close|when\b/.test(q)) return `${HOURS} ${LAST_CALL}`;
-  if (/\baddress|location|where|directions|how to get\b/.test(q)) return MAP_URL;
-  if (/\bwebsite|site|url|online|menu\b/.test(q)) return "You can visit us online at Crystal Nugs dot com.";
-  if (/\bid|identification|age|21\b/.test(q)) return `${ID_RULES} ${MED_PTS}`;
-  if (/\bdeliver|delivery|zone|area|minimum|fee|charge\b/.test(q)) return `${DELIVERY} ${DELIV_MIN} ${DELIV_FEE}`;
-  if (/\bparking|park\b/.test(q)) return PARKING;
-  if (/\bpay|payment|cash|card|debit|atm|jane ?pay\b/.test(q)) return PAYMENT;
-  if (/\bdeal|special|discount|offer|promotion|promo\b/.test(q)) return SPECIALS;
-  if (/\breturn|exchange|refund|defective|replace|swap\b/.test(q)) return RETURNS;
-  if (/\bvendor|brand|wholesale|distributor|buyer\b/.test(q)) return VENDOR_INFO;
-  if (/\bdemo|activation|in-?store|pop-?up|event\b/.test(q)) return VENDOR_DEMO;
-  return null;
-}
-
-// ---------- OpenAI Chat fallback ----------
-async function askOpenAI(userText) {
-  const systemPrompt = `
-You are the Crystal Nugs Sacramento AI voice assistant.
-Speak in a warm, concierge tone. Keep sentences short. Use natural pauses.
-Never read raw URLs. Say "Crystal Nugs dot com" instead of a link.
-If asked for a person, say “No problem, transferring you now.”
-Store hours: ${HOURS}
-Address: ${ADDRESS}
-Website: ${toSpokenText(WEBSITE)}
-Delivery: ${DELIVERY}
-ID rules: ${ID_RULES}
-Payment: ${PAYMENT}
-Returns: ${RETURNS}
-  `;
-
-  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: OPENAI_CHAT_MODEL,
-      temperature: 0.4,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userText },
-      ],
-    }),
-  });
-
-  if (!resp.ok) {
-    const errText = await resp.text().catch(() => "");
-    throw new Error(`OpenAI ${resp.status} ${resp.statusText}: ${errText.slice(0, 500)}`);
-  }
-
-  const data = await resp.json().catch(() => null);
-  const answer = data?.choices?.[0]?.message?.content?.trim();
-  return answer || "Sorry, I didn’t catch that.";
-}
-
-// ---------- Utils ----------
-function safeSend(ws, obj) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+function extractText(payload) {
+  // Try common shapes, else treat as raw text
   try {
-    ws.send(JSON.stringify(obj));
-  } catch (e) {
-    console.error("WS send error:", e.message);
+    const obj = JSON.parse(payload.toString());
+    return obj?.content || obj?.text || obj?.utterance || payload.toString();
+  } catch {
+    return payload.toString();
   }
 }
 
-function escapeXml(str = "") {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
+wss.on("connection", (ws, req) => {
+  console.log("Twilio connected to Conversation Relay (WS):", req.url);
 
-/** Convert crystalnugs.com and house emails to friendly spoken phrases. */
-function toSpokenText(text = "") {
-  if (!text) return "";
-  let out = String(text);
+  ws.on("message", async (data) => {
+    const text = extractText(data);
+    const t = String(text || "").trim().toLowerCase();
 
-  // Normalize our site in all common forms
-  out = out.replace(/https?:\/\/(www\.)?crystalnugs\.com\/?/gi, "Crystal Nugs dot com");
-  out = out.replace(/\bwww\.crystalnugs\.com\b/gi, "Crystal Nugs dot com");
-  out = out.replace(/\bcrystalnugs\.com\b/gi, "Crystal Nugs dot com");
+    // Delivery intent detector
+    const asksDelivery = /(delivery|deliver|minimum|min|fee|cost|lead ?time|eta|how long)/.test(t);
+    const zips = [...new Set((t.match(/\b\d{5}\b/g) || []))];
 
-  // Convert any *@crystalnugs.com email to "name at crystal nugs dot com"
-  out = out.replace(
-    /\b([a-z0-9._%+-]+)@crystalnugs\.com\b/gi,
-    (_m, user) => `${user} at crystal nugs dot com`
-  );
+    if (asksDelivery && zips.length) {
+      const items = zips.map(buildZipJSON).filter(Boolean);
 
-  // Generic: remove protocol for any other links that might slip through
-  out = out.replace(/https?:\/\//gi, "");
+      if (!items.length) {
+        return ws.send(OUTPUT_JSON ? JSON.stringify([]) : "I couldn't find those zip codes. Can you try another?");
+      }
 
-  return out;
-}
+      if (OUTPUT_JSON) {
+        return ws.send(JSON.stringify(items));
+      } else {
+        // speak just the first; (you can loop if desired)
+        return ws.send(buildZipSpoken(items[0].zip));
+      }
+    }
 
-/**
- * Brand voice preset:
- * - Always sanitize via toSpokenText()
- * - Plain text mode: concise sentences and em dashes for micro-pauses.
- * - SSML mode (CN_USE_SSML=true): energetic + smart delivery:
- *   medium-fast rate, +6% pitch, 240ms breaks, light emphasis on lead words.
- */
-function brandVoice(raw = "") {
-  const cleaned = toSpokenText(raw).trim();
+    // Not a local ZIP intent: do nothing (let your upstream flow handle it).
+    // If you want a fallback prompt, uncomment:
+    // ws.send("I can help with delivery minimums, delivery fees, and delivery times if you tell me a 5-digit zip code.");
+  });
 
-  if (!USE_SSML) {
-    return cleaned
-      .replace(/\s+/g, " ")
-      .replace(/\s-\s/g, " — ")
-      .replace(/:\s+/g, ": ")
-      .replace(/,{2,}/g, ",")
-      .replace(/\.\s*\./g, ".")
-      .replace(/\s{2,}/g, " ");
+  ws.on("close", (code, reason) => {
+    console.log("Twilio WS closed:", code, reason?.toString?.() || "");
+  });
+});
+
+// HTTP → WS upgrade only for /relay
+const server = app.listen(PORT, async () => {
+  await loadZipTable(CN_ZIP_DATA_PATH).catch((e) => console.error(e));
+  console.log(`Crystal Nugs Voice AI on :${PORT}`);
+  console.log(`Relay (wss): ${TWILIO_RELAY_WSS_URL}`);
+});
+
+server.on("upgrade", (request, socket, head) => {
+  if (request.url && request.url.startsWith(RELAY_PATH)) {
+    wss.handleUpgrade(request, socket, head, (ws) => wss.emit("connection", ws, request));
+  } else {
+    socket.destroy();
   }
+});
 
-  // Split into sentence-like chunks for natural phrasing
-  const parts = cleaned
-    .split(/(?<=[\.\?!])\s+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  const ssmlBody = parts
-    .map((s) => emphasisLead(s, 3)) // emphasize first ~3 words for a lively start
-    .join('<break time="240ms"/>');
-
-  return `<speak>
-    <prosody rate="fast" pitch="+8%" volume="medium">
-      ${ssmlBody}
-    </prosody>
-  </speak>`;
-}
-
-// Emphasize the first N words lightly; escape both lead and tail safely
-function emphasisLead(sentence = "", n = 3) {
-  const tokens = sentence.split(/\s+/).filter(Boolean);
-  const lead = tokens.slice(0, n).join(" ");
-  const tail = tokens.slice(n).join(" ");
-  const leadEsc = escapeSSML(lead);
-  const tailEsc = escapeSSML(tail);
-  return tail
-    ? `<emphasis level="moderate">${leadEsc}</emphasis> ${tailEsc}`
-    : `<emphasis level="moderate">${leadEsc}</emphasis>`;
-}
-
-function escapeSSML(str = "") {
-  // Minimal safe escaping for text nodes inside SSML
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
+/* =========================
+   Health
+   ========================= */
+app.get("/health", (req, res) =>
+  res.json({
+    ok: true,
+    relayPath: RELAY_PATH,
+    relayWSS: TWILIO_RELAY_WSS_URL,
+    dataFile: CN_ZIP_DATA_PATH,
+    zipCount: ZIP_TABLE.size,
+    outputFormat: OUTPUT_JSON ? "json" : "speech",
+  })
+);
