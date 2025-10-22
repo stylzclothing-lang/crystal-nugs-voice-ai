@@ -1,19 +1,22 @@
-// server.js — Crystal Nugs Voice AI (Conversation Relay with auto-negotiated reply schema)
-// - Keeps your <ConversationRelay ... welcomeGreeting="...">
-// - Answers ZIP min/fee/time from /data/zipzones.json (or CN_ZIP_DATA_URL)
-// - Auto-detects which outbound payload schema your Relay expects:
-//     Tries formats in order until Relay stops sending 64107 errors, then sticks with it.
-// - Never silent: always responds to prompt events.
+// server.js — Crystal Nugs Voice AI (CommonJS build for Render)
+// - TwiML with <ConversationRelay ... welcomeGreeting="...">
+// - WS: auto-negotiates outbound payload schema to avoid 64107
+// - Loads zips from ./data/zipzones.json or CN_ZIP_DATA_URL
+// - Answers ZIP min/fee/time; plus hours/address/phone/site; fallback
 
-import express from "express";
-import bodyParser from "body-parser";
-import { config } from "dotenv";
-import * as WS from "ws";
-import fs from "fs/promises";
-import path from "path";
-import fetch from "node-fetch";
+const express = require("express");
+const bodyParser = require("body-parser");
+require("dotenv").config();
+const { WebSocketServer } = require("ws");
+const fs = require("fs/promises");
+const path = require("path");
 
-config();
+// Optional fetch for remote data (Node >=18 has global fetch)
+async function getFetch() {
+  if (typeof fetch === "function") return fetch;
+  const mod = await import("node-fetch");
+  return mod.default;
+}
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -40,7 +43,7 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const CN_ZIP_DATA_PATH = process.env.CN_ZIP_DATA_PATH || "./data/zipzones.json";
 const CN_ZIP_DATA_URL = process.env.CN_ZIP_DATA_URL || "";
 
-// Non-zip quick answers
+// Non-zip quick answers (use your existing envs if set)
 const CN_HOURS = process.env.CN_HOURS || "We’re open daily; last call is ~90 minutes before close.";
 const CN_ADDRESS = process.env.CN_ADDRESS || "2300 J Street, Sacramento, CA 95816";
 const CN_PHONE = process.env.CN_PHONE || "+1 (916) 507-XXXX";
@@ -51,7 +54,7 @@ const CN_WEBSITE = process.env.CN_WEBSITE || "crystalnugs.com";
 ========================= */
 let ZIP_TABLE = new Map(); // zip -> { min, fee, lead, lastCall }
 
-const parseCsv = (raw) => {
+function parseCsv(raw) {
   const lines = raw.split(/\r?\n/).filter((l) => l.trim().length);
   if (!lines.length) return [];
   const header = lines[0].split(",").map((h) => h.trim().toLowerCase());
@@ -61,20 +64,20 @@ const parseCsv = (raw) => {
     header.forEach((h, i) => (obj[h] = cols[i]));
     return obj;
   });
-};
+}
 
-const normHeaders = (row) => {
+function normHeaders(row) {
   const nk = (k) => (k || "").toLowerCase().replace(/\s+/g, "_");
   const o = {};
-  for (const [k, v] of Object.entries(row || {})) o[nk(k)] = v;
+  Object.entries(row || {}).forEach(([k, v]) => (o[nk(k)] = v));
 
   const zipcode = o.zipcode ?? o.zip ?? o.postal_code ?? o.postcode ?? o.code ?? o.zip_code;
   const min = o.delivery_minimum ?? o.minimum ?? o.min ?? o.min_order ?? o.delivery_min;
   const fee = o.delivery_fee ?? o.fee ?? o.delivery_cost ?? o.service_fee;
-  const lead = o.lead_time ?? o.lead ?? o.eta ?? o.lead_minutes; // minutes
+  const lead = o.lead_time ?? o.lead ?? o.eta ?? o.lead_minutes;
   const last = o.last_call ?? o.last_call_minutes;
   return { zipcode, min, fee, lead, lastCall: last };
-};
+}
 
 function parseZipTable(raw, ext) {
   const map = new Map();
@@ -121,7 +124,8 @@ async function loadZipTableFromFile(filePath) {
 }
 
 async function loadZipTableFromUrl(url) {
-  const r = await fetch(url);
+  const $fetch = await getFetch();
+  const r = await $fetch(url);
   if (!r.ok) throw new Error(`Fetch failed ${r.status}`);
   const raw = await r.text();
   const ext = url.toLowerCase().includes(".csv") ? ".csv" : ".json";
@@ -209,3 +213,209 @@ function escapeXml(s = "") {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&apos;")
     .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/* =========================
+   JSON API (batch zips)
+========================= */
+app.post("/intent/zip-batch", (req, res) => {
+  const zips = Array.isArray(req.body?.zips) ? req.body.zips : [];
+  if (!zips.length) return res.status(400).json({ ok: false, error: "Provide zips: string[]" });
+  const data = buildZipArray(zips);
+  if (!data.length) return res.status(404).json({ ok: false, error: "No matching zips" });
+  return res.json(data);
+});
+
+/* =========================
+   ADMIN: Hot reload data
+========================= */
+app.post("/admin/reload-zips", async (req, res) => {
+  const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  try {
+    await bootZipTable();
+    return res.json({ ok: true, rows: ZIP_TABLE.size });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* =========================
+   HEALTH
+========================= */
+app.get("/health", (req, res) =>
+  res.json({
+    ok: true,
+    relay: WS_RELAY_PUBLIC_URL || null,
+    rows: ZIP_TABLE.size,
+  })
+);
+
+/* =========================
+   WEBSOCKET + AUTO SCHEMA
+========================= */
+// Candidate outbound formats (ordered). We’ll bump if Relay sends 64107.
+const SCHEMAS = [
+  (text) => ({ type: "response", voiceResponse: text }),
+  (text) => ({ type: "assistant", content: text }),
+  (text) => ({ type: "message", message: text }),
+  (text) => ({ type: "say", text }),
+  (text) => ({ response: text }),
+  (text) => ({ type: "response", text }),
+  (text) => ({ type: "response", voice_response: text }),
+  (text) => ({ speech: text }),
+  (text) => text // plain string
+];
+
+const wss = new WebSocketServer({ noServer: true });
+
+function connState(socket) {
+  if (!socket._state) socket._state = { schemaIndex: 0, lastText: "" };
+  return socket._state;
+}
+
+function trySend(socket, text, isRetry = false) {
+  const state = connState(socket);
+  state.lastText = text;
+
+  const build = SCHEMAS[state.schemaIndex] || SCHEMAS[0];
+  const payload = build(String(text || ""));
+  const wire = typeof payload === "string" ? payload : JSON.stringify(payload);
+
+  try {
+    if (typeof socket.send === "function") {
+      socket.send(wire);
+      console.log("[WS OUT]", typeof payload === "string" ? payload : payload);
+    } else {
+      console.error("trySend: socket.send is not a function");
+    }
+  } catch (e) {
+    console.error("WS send error:", e);
+  }
+
+  if (!isRetry) {
+    // errors are handled on 'error' message path from Relay
+  }
+}
+
+function bumpSchemaAndResend(socket) {
+  const state = connState(socket);
+  state.schemaIndex = Math.min(state.schemaIndex + 1, SCHEMAS.length - 1);
+  console.warn("[SCHEMA] Bumping to index", state.schemaIndex);
+  if (state.lastText) trySend(socket, state.lastText, true);
+}
+
+wss.on("connection", (socket) => {
+  console.log("[WS] connected");
+
+  socket.on("message", async (data) => {
+    const raw = data.toString();
+    console.log("[WS IN]", raw);
+
+    let msg = {};
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      return;
+    }
+
+    if (msg.type === "setup") return;
+
+    if (msg.type === "error") {
+      const desc = String(msg.description || "");
+      if (desc.includes("Invalid message") || desc.includes("64107")) {
+        bumpSchemaAndResend(socket);
+      }
+      return;
+    }
+
+    if (msg.type === "prompt") {
+      const text = String(msg.voicePrompt || "").trim();
+      const t = text.toLowerCase();
+
+      // Delivery ZIP intent
+      const zips = t.match(/\b\d{5}\b/g) || [];
+      const asksDelivery =
+        /(delivery|deliver|minimum|min|fee|cost|lead ?time|eta|how long|time|timing)/.test(t);
+
+      if (zips.length && asksDelivery) {
+        const arr = buildZipArray(zips);
+        if (arr.length) {
+          if (arr.length === 1) {
+            const r = arr[0];
+            const spokenZip = r.zip.split("").join(" ");
+            trySend(
+              socket,
+              `For zip code ${spokenZip}, the delivery minimum is $${r.minimum}, the delivery fee is $${r.fee.toFixed(
+                2
+              )}. ${r.deliveryTime}.`
+            );
+          } else {
+            const first = arr
+              .slice(0, 3)
+              .map((r) => `${r.zip}: $${r.minimum} min, $${r.fee.toFixed(2)} fee`)
+              .join("; ");
+            trySend(socket, `I found ${arr.length} zip codes. ${first}.`);
+          }
+          return;
+        } else {
+          trySend(socket, "I couldn't find that delivery zone. Try another zip code.");
+          return;
+        }
+      }
+
+      // Hours / Address / Phone / Website
+      if (/\bhour|open|close|closing|last call\b/.test(t)) {
+        trySend(socket, CN_HOURS);
+        return;
+      }
+      if (/\baddress|location|where\b/.test(t)) {
+        trySend(socket, CN_ADDRESS);
+        return;
+      }
+      if (/\bphone|call|number\b/.test(t)) {
+        trySend(socket, `Our phone number is ${CN_PHONE}.`);
+        return;
+      }
+      if (/\bwebsite|site|url\b/.test(t)) {
+        trySend(socket, `Our website is ${CN_WEBSITE}.`);
+        return;
+      }
+
+      // Fallback
+      trySend(
+        socket,
+        "I can help with delivery minimums, fees, and timing for any zip code. Try saying, delivery minimum for nine five eight two seven."
+      );
+      return;
+    }
+  });
+
+  socket.on("close", (code, reason) => {
+    console.log("[WS] closed", code, reason?.toString());
+  });
+});
+
+/* =========================
+   HTTP → WS UPGRADE
+========================= */
+const server = app.listen(PORT, async () => {
+  await bootZipTable();
+  console.log(`Server :${PORT}`);
+  console.log(`Relay WS public URL: ${WS_RELAY_PUBLIC_URL || "(set WS_RELAY_PUBLIC_URL)"}`);
+});
+
+server.on("upgrade", (request, socket, head) => {
+  // Render passes only the path (no host), build a URL to get pathname
+  const url = new URL(request.url, "http://localhost");
+  if (url.pathname === "/relay") {
+    wss.handleUpgrade(request, socket, head, (conn) => {
+      wss.emit("connection", conn, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
