@@ -260,25 +260,33 @@ app.get("/health", (req, res) =>
 );
 
 /* -------------------------
-   WEBSOCKET: /relay
+   WEBSOCKET: /relay  (PATCHED)
 -------------------------- */
 const wss = new WebSocketServer({ noServer: true });
 
+function sendAssistant(ws, content) {
+  // Most Conversation Relay setups accept plain text. If your client expects JSON,
+  // wrap as needed. We'll send plain text by default.
+  const payload = typeof content === "string" ? content : JSON.stringify(content);
+  try { ws.send(payload); } catch (e) { console.error("WS send error:", e); }
+}
+
 wss.on("connection", (ws, req) => {
-  // If you want: send a system hello
-  // ws.send(JSON.stringify({ type: "system", event: "connected" }));
+  console.log("[WS] connected");
 
   ws.on("message", async (data) => {
-    // Conversation Relay sends JSON lines—adjust as needed for your setup.
+    // ---- DEBUG: log what we got
+    let raw = data.toString();
+    console.log("[WS IN]", raw.slice(0, 500));
+
+    // Extract plain text from possible JSON envelopes
     let text = "";
     try {
-      const obj = JSON.parse(data.toString());
-      // common shapes: { type:'user', content:'...' } or { text:'...' }
-      text = obj?.content || obj?.text || obj?.utterance || String(data || "");
+      const obj = JSON.parse(raw);
+      text = obj?.content || obj?.text || obj?.utterance || raw;
     } catch {
-      text = data.toString();
+      text = raw;
     }
-
     const t = String(text || "").trim().toLowerCase();
 
     // Collect all 5-digit zips
@@ -289,17 +297,42 @@ wss.on("connection", (ws, req) => {
     if (zipMatches.length && asksDelivery) {
       const payload = buildZipArray(zipMatches);
       if (payload.length) {
-        // Many Relay setups accept plain text; we’ll send JSON string to be explicit
-        ws.send(JSON.stringify(payload));
-        return; // handled locally, don't forward to any LLM
+        console.log("[WS OUT] zip payload", payload.slice(0, 3), payload.length, "items total");
+        // return EXACT JSON array you asked for
+        sendAssistant(ws, payload);
+        return; // handled
       }
     }
 
-    // Otherwise: echo back minimal “not understood” or pass-through
-    // If you have an LLM/Agent layer, call it here and ws.send its response.
-    // For now, we keep it quiet to let your welcomeGreeting do the work.
+    // ---- Other popular intents (optional quick answers using your envs)
+    if (/\bhour|open|close|closing|last call\b/.test(t)) {
+      sendAssistant(ws, process.env.CN_HOURS || "We’re open daily; last call about 90 minutes before close.");
+      return;
+    }
+    if (/\baddress|location|where\b/.test(t)) {
+      sendAssistant(ws, process.env.CN_ADDRESS || "Our Sacramento location address is on file.");
+      return;
+    }
+    if (/\bphone|call|number\b/.test(t)) {
+      sendAssistant(ws, process.env.CN_PHONE || "Our phone number is on file.");
+      return;
+    }
+    if (/\bwebsite|site|url\b/.test(t)) {
+      sendAssistant(ws, process.env.CN_WEBSITE || "Our website is on file.");
+      return;
+    }
+
+    // ---- SAFE FALLBACK so it never stays silent
+    sendAssistant(
+      "I can help with delivery minimums, fees, and timing for any zip code. Try: “delivery minimum for 95827”. I can also answer hours, address, directions, payment, and more."
+    );
+  });
+
+  ws.on("close", (code, reason) => {
+    console.log("[WS] closed", code, reason?.toString());
   });
 });
+
 
 /* -------------------------
    HTTP → WS Upgrade
