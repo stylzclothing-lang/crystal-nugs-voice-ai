@@ -1,5 +1,5 @@
-// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F) — Fixed WS + Hardened OpenAI + Sanitizer
-// Twilio Conversation Relay (TEXT) + Local Intents + OpenAI fallback
+// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F)
+// Fixed WS + Hardened OpenAI + URL/Email Sanitizer + ZIP Min/Fee + ETA Window
 
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
@@ -81,6 +81,104 @@ const MAP_URL =
   process.env.CN_DIRECTIONS_URL ||
   "Crystal Nugs is at 2300 J Street in Midtown Sacramento — the neon green building on the corner of J and 23rd.";
 
+// ===== Delivery Minimum + Fee + ETA Window table
+// You can override completely with env JSON:
+// CN_DELIVERY_TABLE='[{"zip":"95816","minimum":40,"fee":1.99,"window":"30–60 minutes"}, ...]'
+const DEFAULT_DELIVERY_TABLE = [
+  // Core-ish (fast)
+  { zip:"95811", minimum:40, fee:1.99, window:"30–60 minutes" },
+  { zip:"95814", minimum:40, fee:1.99, window:"30–60 minutes" },
+  { zip:"95815", minimum:40, fee:1.99, window:"30–60 minutes" },
+  { zip:"95816", minimum:40, fee:1.99, window:"30–60 minutes" },
+  { zip:"95817", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95818", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95819", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95820", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95821", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95822", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95823", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95824", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95825", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95826", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95827", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95828", minimum:40, fee:1.99, window:"45–75 minutes" },
+  // Near ring (slower)
+  { zip:"95829", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95605", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95691", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95798", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95799", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95673", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95626", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95652", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95838", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95628", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95670", minimum:60, fee:1.99, window:"75–150 minutes" },
+  { zip:"95655", minimum:60, fee:1.99, window:"75–150 minutes" },
+  { zip:"95683", minimum:125, fee:1.99, window:"120–240 minutes" },
+  { zip:"95741", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95742", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95610", minimum:60, fee:1.99, window:"75–150 minutes" },
+  { zip:"95611", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95621", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95841", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95608", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95609", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95660", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95842", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95830", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95831", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95832", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95833", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95834", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95835", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95836", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95837", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95843", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95864", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95695", minimum:65, fee:1.99, window:"90–180 minutes" },
+  { zip:"95776", minimum:70, fee:1.99, window:"90–180 minutes" },
+  { zip:"95616", minimum:65, fee:1.99, window:"90–180 minutes" },
+  { zip:"95617", minimum:65, fee:1.99, window:"90–180 minutes" },
+  { zip:"95618", minimum:65, fee:1.99, window:"90–180 minutes" },
+  { zip:"95662", minimum:70, fee:1.99, window:"90–180 minutes" },
+  { zip:"95668", minimum:60, fee:1.99, window:"75–150 minutes" },
+  { zip:"95630", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95671", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95763", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95762", minimum:100, fee:1.99, window:"90–180 minutes" },
+  { zip:"95677", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95678", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95747", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95765", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95650", minimum:100, fee:1.99, window:"90–180 minutes" },
+  { zip:"95661", minimum:70, fee:1.99, window:"90–180 minutes" },
+  { zip:"95746", minimum:60, fee:1.99, window:"75–150 minutes" },
+  { zip:"95648", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95624", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95757", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95758", minimum:70, fee:1.99, window:"90–180 minutes" },
+  { zip:"95759", minimum:70, fee:1.99, window:"90–180 minutes" },
+  { zip:"95632", minimum:80, fee:3.49, window:"90–180 minutes" },
+  { zip:"95612", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95693", minimum:125, fee:3.49, window:"120–240 minutes" },
+  { zip:"95639", minimum:80, fee:3.49, window:"120–240 minutes" },
+  { zip:"95672", minimum:80, fee:1.99, window:"90–180 minutes" }
+];
+
+// Allow env override (and auto-compute windows if omitted)
+let DELIVERY_TABLE = DEFAULT_DELIVERY_TABLE;
+try {
+  const override = process.env.CN_DELIVERY_TABLE ? JSON.parse(process.env.CN_DELIVERY_TABLE) : null;
+  if (Array.isArray(override) && override.length) DELIVERY_TABLE = override;
+} catch { /* keep default */ }
+
+// Normalize: ensure each record has a window
+DELIVERY_TABLE = DELIVERY_TABLE.map(r => ({
+  ...r,
+  window: r.window || computeEtaWindow(r.minimum, r.zip)
+}));
+
 // ---------- Health ----------
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
@@ -90,7 +188,6 @@ app.post("/twilio/voice", (req, res) => {
   const greeting =
     "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?";
 
-  // Google Wavenet (luxury concierge female)
   const twiml =
     `<Response>
        <Connect>
@@ -126,7 +223,6 @@ const server = app.listen(PORT, () => {
 });
 
 server.on("upgrade", (req) => {
-  // Helps confirm Twilio is attempting a WS upgrade
   console.log("HTTP upgrade (WS) ->", req.url);
 });
 
@@ -142,61 +238,64 @@ wss.on("connection", async (twilioWS) => {
 
   twilioWS.on("message", async (buf) => {
     let msg;
-    try {
-      msg = JSON.parse(buf.toString());
-    } catch {
-      return;
-    }
-
+    try { msg = JSON.parse(buf.toString()); } catch { return; }
     if (msg.type === "setup") return;
 
     if (msg.type === "prompt" && msg.voicePrompt) {
       const userText = msg.voicePrompt.trim().toLowerCase();
       console.log("Caller said:", userText);
 
-      // 1) Local intents (fast path)
       const local = handleLocalIntent(userText);
       if (local) {
         safeSend(twilioWS, { type: "text", token: brandVoice(local), last: true });
         return;
       }
 
-      // 2) Fallbacks
       if (!OPENAI_API_KEY) {
-        safeSend(twilioWS, {
-          type: "text",
-          token: brandVoice("Sorry, I’m having trouble connecting right now."),
-          last: true,
-        });
+        safeSend(twilioWS, { type: "text", token: brandVoice("Sorry, I’m having trouble connecting right now."), last: true });
         return;
       }
 
-      // 3) OpenAI fallback
       try {
         const answer = await askOpenAI(userText);
         safeSend(twilioWS, { type: "text", token: brandVoice(answer), last: true });
       } catch (e) {
         console.error("OpenAI HTTPS error:", e.message);
-        safeSend(twilioWS, {
-          type: "text",
-          token: brandVoice("Sorry, our assistant is currently busy. Please call back shortly."),
-          last: true,
-        });
+        safeSend(twilioWS, { type: "text", token: brandVoice("Sorry, our assistant is currently busy. Please call back shortly."), last: true });
       }
     }
   });
 
-  twilioWS.on("error", (err) => {
-    console.error("Twilio WS error:", err?.message || err);
-  });
-
-  twilioWS.on("close", (code, reason) => {
-    console.log("Twilio WS closed:", code, reason?.toString());
-  });
+  twilioWS.on("error", (err) => console.error("Twilio WS error:", err?.message || err));
+  twilioWS.on("close", (code, reason) => console.log("Twilio WS closed:", code, reason?.toString()));
 });
 
 // ---------- Local Intent Handler ----------
 function handleLocalIntent(q = "") {
+  const maybeZip = extractZip(q);
+  const asksMin = /\b(min|minimum|order minimum|what.*minimum)\b/.test(q);
+  const asksFee = /\b(fee|delivery fee|charge|cost)\b/.test(q);
+  const asksDelivery = /\bdeliver|delivery|zone|area|order|eta|time|how long|arrive\b/.test(q);
+
+  // ZIP-specific answers for minimum/fee/ETA
+  if ((asksMin || asksFee || asksDelivery) && maybeZip) {
+    const rec = deliveryByZip(maybeZip);
+    const z = speakZip(maybeZip);
+    if (rec) {
+      const min = formatMoney(rec.minimum);
+      const fee = formatMoney(rec.fee);
+      const win = rec.window || computeEtaWindow(rec.minimum, maybeZip);
+      return `For ZIP ${z}: estimated delivery ${win}. Delivery minimum ${min}. Delivery fee ${fee}. ${LAST_CALL}`;
+    }
+    return `For ZIP ${z}: I don’t have a set delivery policy. Please share a nearby ZIP or ask for a human and I’ll connect you.`;
+  }
+
+  // Ask for ZIP (hyphenated example) if they ask about minimum/fee/ETA without a ZIP
+  if (asksMin || asksFee || asksDelivery) {
+    return `What’s your 5-digit ZIP so I can confirm your delivery window, minimum, and fee? For example: 9-5-8-1-6.`;
+  }
+
+  // Existing intents…
   if (/\bhour|open|close|when\b/.test(q)) return `${HOURS} ${LAST_CALL}`;
   if (/\baddress|location|where|directions|how to get\b/.test(q)) return MAP_URL;
   if (/\bwebsite|site|url|online|menu\b/.test(q)) return "You can visit us online at Crystal Nugs dot com.";
@@ -256,50 +355,62 @@ Returns: ${RETURNS}
 // ---------- Utils ----------
 function safeSend(ws, obj) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  try {
-    ws.send(JSON.stringify(obj));
-  } catch (e) {
-    console.error("WS send error:", e.message);
-  }
+  try { ws.send(JSON.stringify(obj)); } catch (e) { console.error("WS send error:", e.message); }
 }
 
 function escapeXml(str = "") {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return String(str).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-/** Convert crystalnugs.com and house emails to friendly spoken phrases. */
+/** Speak ZIP as hyphenated digits: "95827" -> "9-5-8-2-7" */
+function speakZip(zip = "") {
+  const z = String(zip).replace(/[^\d]/g, "").slice(0, 5);
+  return z.split("").join("-");
+}
+
+/** Extract first 5-digit ZIP from text */
+function extractZip(text = "") {
+  const m = String(text).match(/\b\d{5}\b/);
+  return m ? m[0] : null;
+}
+
+/** Lookup delivery record by ZIP */
+function deliveryByZip(zip) {
+  return DELIVERY_TABLE.find((r) => r.zip === zip) || null;
+}
+
+/** Format money; 40 -> $40, 1.99 -> $1.99 */
+function formatMoney(n) {
+  const num = Number(n);
+  if (Number.isNaN(num)) return String(n);
+  const s = num.toFixed(2);
+  return s.endsWith(".00") ? `$${parseInt(s, 10)}` : `$${s}`;
+}
+
+/** Compute ETA window if not set, based on minimum (tunable logic) */
+function computeEtaWindow(minimum, zip) {
+  const m = Number(minimum) || 0;
+  if (m <= 40) return "30–60 minutes";
+  if (m <= 50) return "45–90 minutes";
+  if (m <= 70) return "60–120 minutes";
+  if (m <= 90) return "75–150 minutes";
+  if (m <= 110) return "90–180 minutes";
+  return "120–240 minutes";
+}
+
+/** Convert crystalnugs.com + emails to friendly spoken phrases */
 function toSpokenText(text = "") {
   if (!text) return "";
   let out = String(text);
-
-  // Normalize our site in all common forms
   out = out.replace(/https?:\/\/(www\.)?crystalnugs\.com\/?/gi, "Crystal Nugs dot com");
   out = out.replace(/\bwww\.crystalnugs\.com\b/gi, "Crystal Nugs dot com");
   out = out.replace(/\bcrystalnugs\.com\b/gi, "Crystal Nugs dot com");
-
-  // Convert any *@crystalnugs.com email to "name at crystal nugs dot com"
-  out = out.replace(
-    /\b([a-z0-9._%+-]+)@crystalnugs\.com\b/gi,
-    (_m, user) => `${user} at crystal nugs dot com`
-  );
-
-  // Generic: remove protocol for any other links that might slip through
+  out = out.replace(/\b([a-z0-9._%+-]+)@crystalnugs\.com\b/gi, (_m, user) => `${user} at crystal nugs dot com`);
   out = out.replace(/https?:\/\//gi, "");
-
   return out;
 }
 
-/**
- * Brand voice preset:
- * - Always sanitize via toSpokenText()
- * - Plain text mode: concise sentences and em dashes for micro-pauses.
- * - SSML mode (CN_USE_SSML=true): energetic + smart delivery:
- *   medium-fast rate, +6% pitch, 240ms breaks, light emphasis on lead words.
- */
+/** Brand voice (plain or SSML) */
 function brandVoice(raw = "") {
   const cleaned = toSpokenText(raw).trim();
 
@@ -313,15 +424,8 @@ function brandVoice(raw = "") {
       .replace(/\s{2,}/g, " ");
   }
 
-  // Split into sentence-like chunks for natural phrasing
-  const parts = cleaned
-    .split(/(?<=[\.\?!])\s+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  const ssmlBody = parts
-    .map((s) => emphasisLead(s, 3)) // emphasize first ~3 words for a lively start
-    .join('<break time="240ms"/>');
+  const parts = cleaned.split(/(?<=[\.\?!])\s+/).map(s => s.trim()).filter(Boolean);
+  const ssmlBody = parts.map(s => emphasisLead(s, 3)).join('<break time="240ms"/>');
 
   return `<speak>
     <prosody rate="fast" pitch="+8%" volume="medium">
@@ -330,22 +434,15 @@ function brandVoice(raw = "") {
   </speak>`;
 }
 
-// Emphasize the first N words lightly; escape both lead and tail safely
 function emphasisLead(sentence = "", n = 3) {
   const tokens = sentence.split(/\s+/).filter(Boolean);
   const lead = tokens.slice(0, n).join(" ");
   const tail = tokens.slice(n).join(" ");
   const leadEsc = escapeSSML(lead);
   const tailEsc = escapeSSML(tail);
-  return tail
-    ? `<emphasis level="moderate">${leadEsc}</emphasis> ${tailEsc}`
-    : `<emphasis level="moderate">${leadEsc}</emphasis>`;
+  return tail ? `<emphasis level="moderate">${leadEsc}</emphasis> ${tailEsc}` : `<emphasis level="moderate">${leadEsc}</emphasis>`;
 }
 
 function escapeSSML(str = "") {
-  // Minimal safe escaping for text nodes inside SSML
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
