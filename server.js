@@ -1,4 +1,4 @@
-// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F) + Live Transfer
+// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F) + Live Transfer (fixed URL + phone)
 // ConversationRelay + Local Intents (ZIP-aware mins/fees/ETA) + Venue-specific answers + OpenAI fallback
 // Includes: URL/email sanitizer, SSML brand voice (optional), robust logging, in-call transfer
 
@@ -18,25 +18,65 @@ app.use(bodyParser.json());
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini";
-const TRANSFER_NUMBER = process.env.TWILIO_VOICE_FALLBACK || "+19165071099";
 const USE_SSML = String(process.env.CN_USE_SSML || "false").toLowerCase() === "true";
 
-// ---------- Helpers for absolute URLs & live transfer ----------
-function absUrl(path = "/") {
-  const base =
-    process.env.PUBLIC_BASE_URL ||
-    (process.env.RENDER_EXTERNAL_URL ? `https://${process.env.RENDER_EXTERNAL_URL}` : "");
-  return `${String(base).replace(/\/+$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
+// Prefer the new transfer env; fall back to prior if present; final fallback is store line.
+const TRANSFER_NUMBER =
+  process.env.TWILIO_TRANSFER_NUMBER ||
+  process.env.TWILIO_VOICE_FALLBACK ||
+  "+19167019777"; // Crystal Nugs store line
+
+// ---------- URL + phone helpers ----------
+function normalizeBaseUrl(u) {
+  let s = String(u || "").trim();
+  if (!s) return "";
+  // If user pasted domain only, add https://
+  if (!/^https?:\/\//i.test(s)) s = `https://${s}`;
+  // Guard against "https://https://..."
+  s = s.replace(/^https?:\/\/https?:\/\//i, "https://");
+  // Remove trailing slash(es)
+  s = s.replace(/\/+$/g, "");
+  return s;
 }
 
+const BASE_URL = normalizeBaseUrl(
+  process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || ""
+);
+// If RENDER_EXTERNAL_URL was just the host, normalizeBaseUrl added https:// for us.
+
+function absUrl(path = "/") {
+  const base = BASE_URL;
+  const p = path.startsWith("/") ? path : `/${path}`;
+  const url = `${base}${p}`;
+  // Final sanity: collapse any accidental double protocol
+  return url.replace(/^https?:\/\/https?:\/\//i, "https://");
+}
+
+function speakPhone(e164 = "+19167019777") {
+  // Turn +19167019777 -> "9-1-6, 7-0-1, 9-7-7-7"
+  const digits = String(e164).replace(/[^\d]/g, "");
+  const parts = digits.startsWith("1") && digits.length === 11
+    ? [digits.slice(1, 4), digits.slice(4, 7), digits.slice(7)]
+    : digits.length === 10
+      ? [digits.slice(0, 3), digits.slice(3, 6), digits.slice(6)]
+      : [digits];
+  return parts
+    .map((seg, i) => seg.split("").join("-") + (i < parts.length - 1 ? "," : ""))
+    .join(" ")
+    .trim();
+}
+
+// ---------- Live transfer (Calls API) ----------
 async function transferLiveCall(callSid) {
   if (!callSid) throw new Error("Missing CallSid for transfer");
   const ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
   const AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
   if (!ACCOUNT_SID || !AUTH_TOKEN) throw new Error("Missing Twilio creds (Account SID/Auth Token)");
+
   const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
   const TRANSFER_URL = absUrl("/twilio/transfer");
   console.log("Attempting live transfer to:", TRANSFER_URL, "CallSid:", callSid);
+
   return client.calls(callSid).update({ method: "POST", url: TRANSFER_URL });
 }
 
@@ -106,9 +146,8 @@ const DELIVERY_PLACES =
   process.env.CN_DELIVERY_PLACES ||
   "Yes — we deliver to hotels, motels, restaurants, bars, and truck stops within our service area. Please have a valid government ID (21+) and the name on the order present at handoff. For hotels, include the registered guest and room number; we can meet at the lobby/front desk if required. For restaurants/bars/truck stops, we’ll meet at the host stand, main entrance, or a designated safe area. Payment: cash or JanePay.";
 
-// ===== Delivery Minimum + Fee + ETA Window table (can override with CN_DELIVERY_TABLE JSON) =====
+// ===== Delivery Minimum + Fee + ETA Window table (overridable with CN_DELIVERY_TABLE JSON) =====
 const DEFAULT_DELIVERY_TABLE = [
-  // Core / fast
   { zip:"95811", minimum:40, fee:1.99, window:"30–60 minutes" },
   { zip:"95814", minimum:40, fee:1.99, window:"30–60 minutes" },
   { zip:"95815", minimum:40, fee:1.99, window:"30–60 minutes" },
@@ -125,8 +164,6 @@ const DEFAULT_DELIVERY_TABLE = [
   { zip:"95826", minimum:40, fee:1.99, window:"45–75 minutes" },
   { zip:"95827", minimum:40, fee:1.99, window:"45–75 minutes" },
   { zip:"95828", minimum:40, fee:1.99, window:"45–75 minutes" },
-
-  // Near ring / slower
   { zip:"95829", minimum:50, fee:1.99, window:"60–120 minutes" },
   { zip:"95605", minimum:40, fee:1.99, window:"45–75 minutes" },
   { zip:"95691", minimum:40, fee:1.99, window:"45–75 minutes" },
@@ -283,9 +320,10 @@ wss.on("connection", async (twilioWS) => {
           console.log("Live transfer initiated for CallSid:", currentCallSid);
         } catch (e) {
           console.error("Transfer error:", e.message);
+          // Speak the correct store line (from TRANSFER_NUMBER)
           safeSend(twilioWS, {
             type: "text",
-            token: brandVoice("I couldn’t transfer the call just now. Here’s our direct line: 9-1-6, 5-0-7, 1-0-9-9."),
+            token: brandVoice(`I couldn’t transfer the call just now. Here’s our direct line: ${speakPhone(TRANSFER_NUMBER)}.`),
             last: true
           });
         }
