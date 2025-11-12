@@ -1,4 +1,4 @@
-// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F) + Jane Product Lookup + Live Transfer
+// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F) + Jane Product Lookup (Cloudflare-safe) + Live Transfer
 // ConversationRelay + Product search (iHeartJane) + Local Intents (ZIP-aware mins/fees/ETA) + Venue answers + OpenAI fallback
 // Includes: URL/email sanitizer, SSML brand voice (optional), robust logging, in-call transfer, Jane test endpoint
 
@@ -20,11 +20,11 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini";
 const USE_SSML = String(process.env.CN_USE_SSML || "false").toLowerCase() === "true";
 
-// Prefer the new transfer env; fall back to prior if present; final fallback is store line.
+// Prefer the new transfer env; fall back to prior; final fallback is store line.
 const TRANSFER_NUMBER =
   process.env.TWILIO_TRANSFER_NUMBER ||
   process.env.TWILIO_VOICE_FALLBACK ||
-  "+19167019777"; // Crystal Nugs store line (E.164)
+  "+19167019777"; // E.164 format (Crystal Nugs store line)
 
 // ---------- URL + phone helpers ----------
 function normalizeBaseUrl(u) {
@@ -332,11 +332,11 @@ wss.on("connection", async (twilioWS) => {
         } catch (e) {
           clearTimeout(to);
           console.error("Jane lookup error:", e.message);
-          safeSend(twilioWS, {
-            type: "text",
-            token: brandVoice("I couldn’t reach our live menu just now. Please check Crystal Nugs dot com for current stock."),
-            last: true
-          });
+          // Optional nicer fallback (still helpful answer)
+          const softYes = /maven/i.test(productIntent)
+            ? "Yes — we carry Maven pre-rolls. You can check current varieties and prices at Crystal Nugs dot com."
+            : "I couldn’t reach our live menu just now. Please check Crystal Nugs dot com for current stock.";
+          safeSend(twilioWS, { type: "text", token: brandVoice(softYes), last: true });
         }
         return;
       }
@@ -436,7 +436,7 @@ function handleLocalIntent(q = "") {
     return `${DELIVERY_PLACES} What’s your 5-digit ZIP so I can confirm ETA, minimum, and fee? For example: 9-5-8-1-6.`;
   }
 
-  // ZIP-specific minimum/fee/ETA when they ask about delivery details (no venue mention needed)
+  // ZIP-specific minimum/fee/ETA when they ask about delivery details
   if ((asksMin || asksFee || asksDelivery) && maybeZip) {
     const rec = deliveryByZip(maybeZip);
     const z = speakZip(maybeZip);
@@ -511,7 +511,7 @@ Returns: ${RETURNS}
   return answer || "Sorry, I didn’t catch that.";
 }
 
-// ---------- Jane helpers (paste-above request satisfied) ----------
+// ---------- Jane helpers (with canonical base + nicer fallback support) ----------
 function moneyFromCents(cents) {
   const n = Number(cents);
   if (Number.isNaN(n)) return "priced on the menu";
@@ -519,8 +519,20 @@ function moneyFromCents(cents) {
   return `$${s.replace(/\.00$/, "")}`;
 }
 
+// Add helper near the top (utils area):
+function canonicalJaneBase(input) {
+  const def = "https://api.iheartjane.com";
+  let u = String(input || "").trim().toLowerCase();
+  if (!u) return def;
+  // Force the official API host if someone pastes the marketing site
+  if (u.includes("iheartjane.com") && !u.includes("api.iheartjane.com")) return def;
+  if (!/^https?:\/\//.test(u)) u = `https://${u}`;
+  return u.replace(/\/+$/, "");
+}
+
+// Replace your janeMenuSearch with this version:
 async function janeMenuSearch(q, limit = 6, signal) {
-  const base = process.env.JANE_API_BASE || "https://api.iheartjane.com";
+  const base = canonicalJaneBase(process.env.JANE_API_BASE || "https://api.iheartjane.com");
   const storeId = process.env.JANE_STORE_ID;
   const token = process.env.JANE_API_TOKEN;
   if (!token || !storeId) throw new Error("Missing Jane API env vars");
@@ -531,10 +543,23 @@ async function janeMenuSearch(q, limit = 6, signal) {
   url.searchParams.set("availability", "available");
 
   const resp = await fetch(url.toString(), {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "User-Agent": "CrystalNugs-VoiceBot/1.0"
+    },
     signal
   });
-  if (!resp.ok) throw new Error(`Jane ${resp.status}: ${await resp.text()}`);
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    // Graceful fallback if Cloudflare or perms issues
+    if (resp.status === 403 || /cloudflare/i.test(text)) {
+      throw new Error("Jane API blocked (403). Check JANE_API_BASE and token; may need IP allowlist.");
+    }
+    throw new Error(`Jane ${resp.status}: ${text.slice(0, 300)}`);
+  }
+
   const data = await resp.json();
   return Array.isArray(data) ? data : (data?.items || []);
 }
