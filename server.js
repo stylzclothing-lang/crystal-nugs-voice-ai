@@ -1,6 +1,6 @@
-// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F) + Live Transfer (fixed URL + phone)
-// ConversationRelay + Local Intents (ZIP-aware mins/fees/ETA) + Venue-specific answers + OpenAI fallback
-// Includes: URL/email sanitizer, SSML brand voice (optional), robust logging, in-call transfer
+// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F) + Jane Product Lookup + Live Transfer
+// ConversationRelay + Product search (iHeartJane) + Local Intents (ZIP-aware mins/fees/ETA) + Venue answers + OpenAI fallback
+// Includes: URL/email sanitizer, SSML brand voice (optional), robust logging, in-call transfer, Jane test endpoint
 
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
@@ -24,17 +24,14 @@ const USE_SSML = String(process.env.CN_USE_SSML || "false").toLowerCase() === "t
 const TRANSFER_NUMBER =
   process.env.TWILIO_TRANSFER_NUMBER ||
   process.env.TWILIO_VOICE_FALLBACK ||
-  "+19167019777"; // Crystal Nugs store line
+  "+19167019777"; // Crystal Nugs store line (E.164)
 
 // ---------- URL + phone helpers ----------
 function normalizeBaseUrl(u) {
   let s = String(u || "").trim();
   if (!s) return "";
-  // If user pasted domain only, add https://
   if (!/^https?:\/\//i.test(s)) s = `https://${s}`;
-  // Guard against "https://https://..."
   s = s.replace(/^https?:\/\/https?:\/\//i, "https://");
-  // Remove trailing slash(es)
   s = s.replace(/\/+$/g, "");
   return s;
 }
@@ -42,22 +39,20 @@ function normalizeBaseUrl(u) {
 const BASE_URL = normalizeBaseUrl(
   process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || ""
 );
-// If RENDER_EXTERNAL_URL was just the host, normalizeBaseUrl added https:// for us.
 
 function absUrl(path = "/") {
   const base = BASE_URL;
   const p = path.startsWith("/") ? path : `/${path}`;
   const url = `${base}${p}`;
-  // Final sanity: collapse any accidental double protocol
   return url.replace(/^https?:\/\/https?:\/\//i, "https://");
 }
 
 function speakPhone(e164 = "+19167019777") {
-  // Turn +19167019777 -> "9-1-6, 7-0-1, 9-7-7-7"
   const digits = String(e164).replace(/[^\d]/g, "");
-  const parts = digits.startsWith("1") && digits.length === 11
-    ? [digits.slice(1, 4), digits.slice(4, 7), digits.slice(7)]
-    : digits.length === 10
+  const parts =
+    digits.startsWith("1") && digits.length === 11
+      ? [digits.slice(1, 4), digits.slice(4, 7), digits.slice(7)]
+      : digits.length === 10
       ? [digits.slice(0, 3), digits.slice(3, 6), digits.slice(6)]
       : [digits];
   return parts
@@ -141,7 +136,7 @@ const MAP_URL =
   process.env.CN_DIRECTIONS_URL ||
   "Crystal Nugs is at 2300 J Street in Midtown Sacramento — the neon green building on the corner of J and 23rd.";
 
-// Venues policy (allowed)
+// Venues policy (allowed when asked)
 const DELIVERY_PLACES =
   process.env.CN_DELIVERY_PLACES ||
   "Yes — we deliver to hotels, motels, restaurants, bars, and truck stops within our service area. Please have a valid government ID (21+) and the name on the order present at handoff. For hotels, include the registered guest and room number; we can meet at the lobby/front desk if required. For restaurants/bars/truck stops, we’ll meet at the host stand, main entrance, or a designated safe area. Payment: cash or JanePay.";
@@ -238,6 +233,16 @@ DELIVERY_TABLE = DELIVERY_TABLE.map(r => ({ ...r, window: r.window || computeEta
 // ---------- Health ----------
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
+// ---------- Optional Jane test endpoint ----------
+app.get("/jane/test", async (_req, res) => {
+  try {
+    const items = await janeMenuSearch("maven pre-roll", 3);
+    res.json({ ok: true, sample: items });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ---------- Voice Webhook ----------
 app.post("/twilio/voice", (req, res) => {
   const wsUrl = `wss://${req.get("host")}/relay`;
@@ -309,7 +314,34 @@ wss.on("connection", async (twilioWS) => {
       const userText = msg.voicePrompt.trim().toLowerCase();
       console.log("Caller said:", userText);
 
-      // Local intents first (fast path)
+      // -------------------------
+      // 0) Product lookup via Jane (BEFORE local intents)
+      // -------------------------
+      const productIntent = detectProductQuery(userText);
+      if (productIntent) {
+        const ac = new AbortController();
+        const to = setTimeout(() => ac.abort(), 5000);
+        try {
+          const results = await janeMenuSearch(productIntent, 6, ac.signal);
+          clearTimeout(to);
+          const list = formatJaneItems(results, 3);
+          const msgOut = list
+            ? `Yes — we carry ${productIntent}. Top picks right now: ${list}. You can order at Crystal Nugs dot com.`
+            : `I didn’t see ${productIntent} available right now. Please check Crystal Nugs dot com for live inventory.`;
+          safeSend(twilioWS, { type: "text", token: brandVoice(msgOut), last: true });
+        } catch (e) {
+          clearTimeout(to);
+          console.error("Jane lookup error:", e.message);
+          safeSend(twilioWS, {
+            type: "text",
+            token: brandVoice("I couldn’t reach our live menu just now. Please check Crystal Nugs dot com for current stock."),
+            last: true
+          });
+        }
+        return;
+      }
+
+      // 1) Local intents (fast path)
       const local = handleLocalIntent(userText);
 
       // Immediate transfer branch
@@ -320,7 +352,6 @@ wss.on("connection", async (twilioWS) => {
           console.log("Live transfer initiated for CallSid:", currentCallSid);
         } catch (e) {
           console.error("Transfer error:", e.message);
-          // Speak the correct store line (from TRANSFER_NUMBER)
           safeSend(twilioWS, {
             type: "text",
             token: brandVoice(`I couldn’t transfer the call just now. Here’s our direct line: ${speakPhone(TRANSFER_NUMBER)}.`),
@@ -335,9 +366,13 @@ wss.on("connection", async (twilioWS) => {
         return;
       }
 
-      // OpenAI fallback
+      // 2) OpenAI fallback
       if (!OPENAI_API_KEY) {
-        safeSend(twilioWS, { type: "text", token: brandVoice("Sorry, I’m having trouble connecting right now."), last: true });
+        safeSend(twilioWS, {
+          type: "text",
+          token: brandVoice("Sorry, I’m having trouble connecting right now."),
+          last: true
+        });
         return;
       }
 
@@ -346,7 +381,11 @@ wss.on("connection", async (twilioWS) => {
         safeSend(twilioWS, { type: "text", token: brandVoice(answer), last: true });
       } catch (e) {
         console.error("OpenAI HTTPS error:", e.message);
-        safeSend(twilioWS, { type: "text", token: brandVoice("Sorry, our assistant is currently busy. Please call back shortly."), last: true });
+        safeSend(twilioWS, {
+          type: "text",
+          token: brandVoice("Sorry, our assistant is currently busy. Please call back shortly."),
+          last: true
+        });
       }
     }
   });
@@ -470,6 +509,69 @@ Returns: ${RETURNS}
   const data = await resp.json().catch(() => null);
   const answer = data?.choices?.[0]?.message?.content?.trim();
   return answer || "Sorry, I didn’t catch that.";
+}
+
+// ---------- Jane helpers (paste-above request satisfied) ----------
+function moneyFromCents(cents) {
+  const n = Number(cents);
+  if (Number.isNaN(n)) return "priced on the menu";
+  const s = (n / 100).toFixed(2);
+  return `$${s.replace(/\.00$/, "")}`;
+}
+
+async function janeMenuSearch(q, limit = 6, signal) {
+  const base = process.env.JANE_API_BASE || "https://api.iheartjane.com";
+  const storeId = process.env.JANE_STORE_ID;
+  const token = process.env.JANE_API_TOKEN;
+  if (!token || !storeId) throw new Error("Missing Jane API env vars");
+
+  const url = new URL(`/v1/stores/${storeId}/menu/items`, base);
+  if (q) url.searchParams.set("q", q);
+  url.searchParams.set("limit", String(limit));
+  url.searchParams.set("availability", "available");
+
+  const resp = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${token}` },
+    signal
+  });
+  if (!resp.ok) throw new Error(`Jane ${resp.status}: ${await resp.text()}`);
+  const data = await resp.json();
+  return Array.isArray(data) ? data : (data?.items || []);
+}
+
+function formatJaneItems(items = [], max = 3) {
+  const picks = items.slice(0, max);
+  if (!picks.length) return null;
+  const parts = picks.map(it => {
+    const brand = it?.brand?.name ? `${it.brand.name} ` : "";
+    const name = it?.name || "pre-roll";
+    const cents = it?.price?.price ?? it?.variants?.[0]?.price?.price ?? null;
+    const price = moneyFromCents(cents);
+    return `${brand}${name} at ${price}`;
+  });
+  return parts.join(", ");
+}
+
+// very light detector — expand as needed
+function detectProductQuery(text = "") {
+  const askedCarry = /\b(carry|have|stock|sell|do you (have|carry))\b/.test(text);
+  const brandHits = [];
+  if (/\bmaven(\s+genetics)?\b/i.test(text)) brandHits.push("Maven");
+  if (/\bstii?izy\b/i.test(text)) brandHits.push("STIIIZY");
+  if (/\braw\s+garden\b/i.test(text)) brandHits.push("Raw Garden");
+
+  const wantsPreroll = /(pre[\s-]?rolls?|joints?|infused pre[\s-]?rolls?)/i.test(text);
+
+  if (brandHits.length && (askedCarry || wantsPreroll)) {
+    return `${brandHits[0]} pre-rolls`;
+  }
+
+  // Generic product lookup: “do you have Gelato pre-rolls”
+  if ((askedCarry || wantsPreroll) && /\b(gelato|zkittlez|blueberry|infused)\b/i.test(text)) {
+    const term = text.match(/\b(gelato|zkittlez|blueberry|infused)\b/i)?.[0];
+    return `${term} pre-rolls`;
+  }
+  return null;
 }
 
 // ---------- Utils ----------
