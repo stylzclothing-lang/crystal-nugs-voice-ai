@@ -65,7 +65,7 @@ const SPECIALS =
 
 const RETURNS =
   process.env.CN_RETURN_POLICY ||
-  "Crystal Nugs may exchange most defective products within 24 hours of purchase when returned in original packaging with a valid receipt, per California DCC regulations.";
+  "Crystal Nugs may exchange most defective products with same product within 24 hours of purchase when returned in original packaging with a valid receipt, per California DCC regulations.";
 
 const VENDOR_INFO =
   process.env.CN_VENDOR_INFO ||
@@ -186,7 +186,7 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 app.post("/twilio/voice", (req, res) => {
   const wsUrl = `wss://${req.get("host")}/relay`;
   const greeting =
-    "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?";
+    "Hey there! Welcome to Crystal Nugs Sacramento — your go-to spot for premium cannabis and good vibes. I can help you with delivery areas, store hours, our address, or frequently asked questions. What can I help you with today?";
 
   const twiml =
     `<Response>
