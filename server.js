@@ -1,5 +1,6 @@
-// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F)
-// Fixed WS + Hardened OpenAI + URL/Email Sanitizer + ZIP Min/Fee + ETA Window
+// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F) + Live Transfer
+// ConversationRelay + Local Intents (ZIP-aware mins/fees/ETA) + Venue-specific answers + OpenAI fallback
+// Includes: URL/email sanitizer, SSML brand voice (optional), robust logging, in-call transfer
 
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
@@ -19,6 +20,25 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini";
 const TRANSFER_NUMBER = process.env.TWILIO_VOICE_FALLBACK || "+19165071099";
 const USE_SSML = String(process.env.CN_USE_SSML || "false").toLowerCase() === "true";
+
+// ---------- Helpers for absolute URLs & live transfer ----------
+function absUrl(path = "/") {
+  const base =
+    process.env.PUBLIC_BASE_URL ||
+    (process.env.RENDER_EXTERNAL_URL ? `https://${process.env.RENDER_EXTERNAL_URL}` : "");
+  return `${String(base).replace(/\/+$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
+async function transferLiveCall(callSid) {
+  if (!callSid) throw new Error("Missing CallSid for transfer");
+  const ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+  const AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+  if (!ACCOUNT_SID || !AUTH_TOKEN) throw new Error("Missing Twilio creds (Account SID/Auth Token)");
+  const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
+  const TRANSFER_URL = absUrl("/twilio/transfer");
+  console.log("Attempting live transfer to:", TRANSFER_URL, "CallSid:", callSid);
+  return client.calls(callSid).update({ method: "POST", url: TRANSFER_URL });
+}
 
 // ===== Business Facts (env-driven; update in Render → Environment) =====
 const HOURS =
@@ -65,7 +85,7 @@ const SPECIALS =
 
 const RETURNS =
   process.env.CN_RETURN_POLICY ||
-  "Crystal Nugs may exchange most defective products with same product within 24 hours of purchase when returned in original packaging with a valid receipt, per California DCC regulations.";
+  "Crystal Nugs may exchange most defective products within 24 hours of purchase when returned in original packaging with a valid receipt, per California DCC regulations.";
 
 const VENDOR_INFO =
   process.env.CN_VENDOR_INFO ||
@@ -81,11 +101,14 @@ const MAP_URL =
   process.env.CN_DIRECTIONS_URL ||
   "Crystal Nugs is at 2300 J Street in Midtown Sacramento — the neon green building on the corner of J and 23rd.";
 
-// ===== Delivery Minimum + Fee + ETA Window table
-// You can override completely with env JSON:
-// CN_DELIVERY_TABLE='[{"zip":"95816","minimum":40,"fee":1.99,"window":"30–60 minutes"}, ...]'
+// Venues policy (allowed)
+const DELIVERY_PLACES =
+  process.env.CN_DELIVERY_PLACES ||
+  "Yes — we deliver to hotels, motels, restaurants, bars, and truck stops within our service area. Please have a valid government ID (21+) and the name on the order present at handoff. For hotels, include the registered guest and room number; we can meet at the lobby/front desk if required. For restaurants/bars/truck stops, we’ll meet at the host stand, main entrance, or a designated safe area. Payment: cash or JanePay.";
+
+// ===== Delivery Minimum + Fee + ETA Window table (can override with CN_DELIVERY_TABLE JSON) =====
 const DEFAULT_DELIVERY_TABLE = [
-  // Core-ish (fast)
+  // Core / fast
   { zip:"95811", minimum:40, fee:1.99, window:"30–60 minutes" },
   { zip:"95814", minimum:40, fee:1.99, window:"30–60 minutes" },
   { zip:"95815", minimum:40, fee:1.99, window:"30–60 minutes" },
@@ -102,7 +125,8 @@ const DEFAULT_DELIVERY_TABLE = [
   { zip:"95826", minimum:40, fee:1.99, window:"45–75 minutes" },
   { zip:"95827", minimum:40, fee:1.99, window:"45–75 minutes" },
   { zip:"95828", minimum:40, fee:1.99, window:"45–75 minutes" },
-  // Near ring (slower)
+
+  // Near ring / slower
   { zip:"95829", minimum:50, fee:1.99, window:"60–120 minutes" },
   { zip:"95605", minimum:40, fee:1.99, window:"45–75 minutes" },
   { zip:"95691", minimum:40, fee:1.99, window:"45–75 minutes" },
@@ -166,18 +190,13 @@ const DEFAULT_DELIVERY_TABLE = [
   { zip:"95672", minimum:80, fee:1.99, window:"90–180 minutes" }
 ];
 
-// Allow env override (and auto-compute windows if omitted)
 let DELIVERY_TABLE = DEFAULT_DELIVERY_TABLE;
 try {
   const override = process.env.CN_DELIVERY_TABLE ? JSON.parse(process.env.CN_DELIVERY_TABLE) : null;
   if (Array.isArray(override) && override.length) DELIVERY_TABLE = override;
 } catch { /* keep default */ }
 
-// Normalize: ensure each record has a window
-DELIVERY_TABLE = DELIVERY_TABLE.map(r => ({
-  ...r,
-  window: r.window || computeEtaWindow(r.minimum, r.zip)
-}));
+DELIVERY_TABLE = DELIVERY_TABLE.map(r => ({ ...r, window: r.window || computeEtaWindow(r.minimum, r.zip) }));
 
 // ---------- Health ----------
 app.get("/health", (_req, res) => res.json({ ok: true }));
@@ -186,7 +205,7 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 app.post("/twilio/voice", (req, res) => {
   const wsUrl = `wss://${req.get("host")}/relay`;
   const greeting =
-    "Hey there! Welcome to Crystal Nugs Sacramento — your go-to spot for premium cannabis and good vibes. I can help you with delivery areas, store hours, our address, or frequently asked questions. What can I help you with today?";
+    "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?";
 
   const twiml =
     `<Response>
@@ -203,7 +222,7 @@ app.post("/twilio/voice", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// ---------- Optional transfer ----------
+// ---------- Transfer endpoint (TwiML) ----------
 app.post("/twilio/transfer", (_req, res) => {
   const vr = new twilio.twiml.VoiceResponse();
   vr.say("No problem. Transferring you now.");
@@ -211,7 +230,7 @@ app.post("/twilio/transfer", (_req, res) => {
   res.type("text/xml").send(vr.toString());
 });
 
-// ---------- Optional call status logs ----------
+// ---------- Call status logs ----------
 app.post("/twilio/status", (req, res) => {
   console.log("Call status:", req.body?.CallStatus, req.body?.CallSid);
   res.sendStatus(200);
@@ -236,21 +255,49 @@ wss.on("error", (err) => {
 wss.on("connection", async (twilioWS) => {
   console.log("Twilio connected to Conversation Relay (HTTPS Chat + local intents)");
 
+  let currentCallSid = null;
+
   twilioWS.on("message", async (buf) => {
     let msg;
     try { msg = JSON.parse(buf.toString()); } catch { return; }
-    if (msg.type === "setup") return;
+
+    // Capture CallSid on setup
+    if (msg.type === "setup") {
+      currentCallSid = msg.callSid || msg.start?.callSid || msg.start?.twilio?.callSid || null;
+      console.log("Setup received. CallSid:", currentCallSid);
+      return;
+    }
 
     if (msg.type === "prompt" && msg.voicePrompt) {
       const userText = msg.voicePrompt.trim().toLowerCase();
       console.log("Caller said:", userText);
 
+      // Local intents first (fast path)
       const local = handleLocalIntent(userText);
+
+      // Immediate transfer branch
+      if (local === "__TRANSFER_NOW__") {
+        safeSend(twilioWS, { type: "text", token: brandVoice("No problem. Transferring you now."), last: true });
+        try {
+          await transferLiveCall(currentCallSid);
+          console.log("Live transfer initiated for CallSid:", currentCallSid);
+        } catch (e) {
+          console.error("Transfer error:", e.message);
+          safeSend(twilioWS, {
+            type: "text",
+            token: brandVoice("I couldn’t transfer the call just now. Here’s our direct line: 9-1-6, 5-0-7, 1-0-9-9."),
+            last: true
+          });
+        }
+        return;
+      }
+
       if (local) {
         safeSend(twilioWS, { type: "text", token: brandVoice(local), last: true });
         return;
       }
 
+      // OpenAI fallback
       if (!OPENAI_API_KEY) {
         safeSend(twilioWS, { type: "text", token: brandVoice("Sorry, I’m having trouble connecting right now."), last: true });
         return;
@@ -273,11 +320,46 @@ wss.on("connection", async (twilioWS) => {
 // ---------- Local Intent Handler ----------
 function handleLocalIntent(q = "") {
   const maybeZip = extractZip(q);
+
+  // Ask-for-human (explicit)
+  const wantsHuman = /\b(representative|agent|human|person|operator|manager|associate|someone|live\s*agent)\b/.test(q);
+  if (wantsHuman) return "__TRANSFER_NOW__";
+
+  // Delivery question types
   const asksMin = /\b(min|minimum|order minimum|what.*minimum)\b/.test(q);
   const asksFee = /\b(fee|delivery fee|charge|cost)\b/.test(q);
-  const asksDelivery = /\bdeliver|delivery|zone|area|order|eta|time|how long|arrive\b/.test(q);
+  const asksDelivery = /\b(deliver|delivery|zone|area|order|eta|time|how long|arrive)\b/.test(q);
 
-  // ZIP-specific answers for minimum/fee/ETA
+  // Explicit "deliver to" phrasing
+  const asksDeliverTo =
+    /\b(can|do|will|y['’]?all|you)\s*(?:.*\s)?(deliver|drop\s?off|bring|meet)\s*(?:to|at)\b/.test(q) ||
+    /\bdeliver\s*(?:to|at)\b/.test(q) ||
+    /\bdo you deliver\b/.test(q);
+
+  // Venue detection
+  const mentionsHotel = /\b(hotel|motel|inn|suite|resort|lodg(e|ing)|air\s?bnb|airbnb)\b/.test(q);
+  const mentionsVenue = /\b(restaurant|bar|club|truck\s?stop|truckstop|gas\s?station|parking\s?lot|diner|cafe|pub)\b/.test(q);
+
+  // ONLY when they explicitly ask "deliver to" one of these venues
+  if (asksDeliverTo && (mentionsHotel || mentionsVenue)) {
+    const z = maybeZip ? speakZip(maybeZip) : null;
+    const placeLabel = venueLabel({ mentionsHotel, mentionsVenue });
+
+    if (z) {
+      const rec = deliveryByZip(maybeZip);
+      if (rec) {
+        const min = formatMoney(rec.minimum);
+        const fee = formatMoney(rec.fee);
+        const win = rec.window || computeEtaWindow(rec.minimum, maybeZip);
+        return `Yes — we deliver to ${placeLabel} in ZIP ${z}. ETA ${win}. Minimum ${min}. Fee ${fee}. ${LAST_CALL}`;
+      }
+      return `Yes — we deliver to ${placeLabel} in that area. For ZIP ${z}, I don’t have a record on file. Share a nearby ZIP and I’ll confirm ETA, minimum, and fee.`;
+    }
+
+    return `${DELIVERY_PLACES} What’s your 5-digit ZIP so I can confirm ETA, minimum, and fee? For example: 9-5-8-1-6.`;
+  }
+
+  // ZIP-specific minimum/fee/ETA when they ask about delivery details (no venue mention needed)
   if ((asksMin || asksFee || asksDelivery) && maybeZip) {
     const rec = deliveryByZip(maybeZip);
     const z = speakZip(maybeZip);
@@ -287,15 +369,15 @@ function handleLocalIntent(q = "") {
       const win = rec.window || computeEtaWindow(rec.minimum, maybeZip);
       return `For ZIP ${z}: estimated delivery ${win}. Delivery minimum ${min}. Delivery fee ${fee}. ${LAST_CALL}`;
     }
-    return `For ZIP ${z}: I don’t have a set delivery policy. Please share a nearby ZIP or ask for a human and I’ll connect you.`;
+    return `For ZIP ${z}: I don’t have a set delivery policy. Share a nearby ZIP and I’ll confirm your window, minimum, and fee.`;
   }
 
-  // Ask for ZIP (hyphenated example) if they ask about minimum/fee/ETA without a ZIP
+  // Ask for ZIP if they want minimum/fee/ETA but didn’t give one
   if (asksMin || asksFee || asksDelivery) {
     return `What’s your 5-digit ZIP so I can confirm your delivery window, minimum, and fee? For example: 9-5-8-1-6.`;
   }
 
-  // Existing intents…
+  // Existing generic intents
   if (/\bhour|open|close|when\b/.test(q)) return `${HOURS} ${LAST_CALL}`;
   if (/\baddress|location|where|directions|how to get\b/.test(q)) return MAP_URL;
   if (/\bwebsite|site|url|online|menu\b/.test(q)) return "You can visit us online at Crystal Nugs dot com.";
@@ -359,7 +441,11 @@ function safeSend(ws, obj) {
 }
 
 function escapeXml(str = "") {
-  return String(str).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 /** Speak ZIP as hyphenated digits: "95827" -> "9-5-8-2-7" */
@@ -387,8 +473,8 @@ function formatMoney(n) {
   return s.endsWith(".00") ? `$${parseInt(s, 10)}` : `$${s}`;
 }
 
-/** Compute ETA window if not set, based on minimum (tunable logic) */
-function computeEtaWindow(minimum, zip) {
+/** Compute ETA window if not set, based on minimum (heuristic) */
+function computeEtaWindow(minimum) {
   const m = Number(minimum) || 0;
   if (m <= 40) return "30–60 minutes";
   if (m <= 50) return "45–90 minutes";
@@ -408,6 +494,13 @@ function toSpokenText(text = "") {
   out = out.replace(/\b([a-z0-9._%+-]+)@crystalnugs\.com\b/gi, (_m, user) => `${user} at crystal nugs dot com`);
   out = out.replace(/https?:\/\//gi, "");
   return out;
+}
+
+/** Venue label helper for natural phrasing */
+function venueLabel({ mentionsHotel, mentionsVenue }) {
+  if (mentionsHotel && mentionsVenue) return "hotels, motels, restaurants, bars, and truck stops";
+  if (mentionsHotel) return "hotels and motels";
+  return "restaurants, bars, and truck stops";
 }
 
 /** Brand voice (plain or SSML) */
