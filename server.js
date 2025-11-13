@@ -632,7 +632,7 @@ async function janeMenuSearch(q, limit = 6, signal) {
   const base = canonicalJaneBase(
     process.env.JANE_API_BASE || "https://pos.iheartjane.com"
   );
-  const merchantId = process.env.JANE_MERCHANT_ID || "724";
+  const merchantId = process.env.JANE_MERCHANT_ID || "56";
   const token = process.env.JANE_API_TOKEN;
   if (!token || !merchantId) {
     throw new Error("Missing Jane POS env vars (JANE_API_TOKEN, JANE_MERCHANT_ID)");
