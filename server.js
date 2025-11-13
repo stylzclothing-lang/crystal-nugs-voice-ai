@@ -290,7 +290,7 @@ app.get("/jane/test", async (_req, res) => {
 app.post("/twilio/voice", (req, res) => {
   const wsUrl = `wss://${req.get("host")}/relay`;
   const greeting =
-    "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?";
+    "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or inventory questions like brands and products. What can I do for you today?";
 
   const twiml = `<Response>
       <Connect>
@@ -337,7 +337,7 @@ wss.on("error", (err) => {
 });
 
 wss.on("connection", async (twilioWS) => {
-  console.log("Twilio connected to Conversation Relay (HTTPS Chat + local intents)");
+  console.log("Twilio connected to Conversation Relay (HTTPS Chat + local intents + Jane inventory)");
 
   let currentCallSid = null;
 
@@ -718,19 +718,18 @@ function formatJaneItems(items = [], max = 3) {
   const picks = items.slice(0, max);
   if (!picks.length) return null;
   const parts = picks.map((it) => {
-    const brand = it?.brand?.name || it?.brand_name || "";
-    const name = (it?.name || it?.product_name || "pre-roll").toString();
+    const src = it?.attributes || it;
+    const name = (src?.name || src?.product_name || "product").toString();
     const cents = extractJanePriceCents(it);
-    const price = moneyFromCents(cents);
-    const brandPart = brand ? `${brand} ` : "";
-    return `${brandPart}${name} at ${price}`;
+    const price = cents != null ? moneyFromCents(cents) : "priced on the menu";
+    return `${name} ${price}`;
   });
   return parts.join(", ");
 }
 
 // ---------- Inventory + brand/category detection ----------
 
-// Very light detector — focuses on brand + “carry/have/stock/sell” + optional category
+// Parse caller’s question into brand + category intent
 function detectProductQuery(text = "") {
   const raw = String(text || "");
   const t = raw.toLowerCase();
@@ -844,14 +843,55 @@ function capitalizeWords(str = "") {
 }
 
 function extractJanePriceCents(item = {}) {
+  // Handle both flat and nested "attributes" shapes
+  const src = item?.attributes || item;
   const direct =
-    item?.price?.price ??
-    item?.price ??
-    item?.variants?.[0]?.price?.price ??
-    item?.variants?.[0]?.price ??
+    src?.price?.price ??
+    src?.price ??
+    src?.variants?.[0]?.price?.price ??
+    src?.variants?.[0]?.price ??
     null;
   const n = Number(direct);
   return Number.isFinite(n) ? n : null;
+}
+
+function getBrandNameFromItem(item = {}) {
+  const src = item?.attributes || item;
+  const brand =
+    src?.brand?.name ??
+    src?.brand_name ??
+    src?.brand ??
+    src?.brandName ??
+    null;
+  if (typeof brand === "string" && brand.trim()) return brand.trim();
+
+  // Fallback: look in JSON blob for known brand tokens
+  const blob = JSON.stringify(item).toLowerCase();
+  if (blob.includes("stiiizy")) return "STIIIZY";
+  if (blob.includes("maven")) return "Maven Genetics";
+  if (blob.includes("raw garden")) return "Raw Garden";
+  return null;
+}
+
+function getCategoryBlobFromItem(item = {}) {
+  const src = item?.attributes || item;
+  return (
+    (src?.category || "") +
+    " " +
+    (src?.product_category || "") +
+    " " +
+    (src?.sub_category || "") +
+    " " +
+    (src?.type || "") +
+    " " +
+    (src?.leaf_category || "") +
+    " " +
+    (src?.flower_type || "") +
+    " " +
+    (src?.concentrate_type || "")
+  )
+    .toString()
+    .toLowerCase();
 }
 
 function filterJaneItemsByIntent(items = [], intent) {
@@ -861,323 +901,14 @@ function filterJaneItemsByIntent(items = [], intent) {
   if (intent.brand) {
     const needle = intent.brand.toLowerCase();
     list = list.filter((it) => {
-      const brand =
-        (it?.brand?.name || it?.brand_name || it?.brand || "").toLowerCase();
-      return brand.includes(needle);
+      const brandName = (getBrandNameFromItem(it) || "").toLowerCase();
+      if (brandName && brandName.includes(needle)) return true;
+
+      // Super forgiving fallback: scan entire JSON for the brand token
+      const blob = JSON.stringify(it).toLowerCase();
+      return blob.includes(needle);
     });
   }
 
   // Keyword/strain filter (if used)
-  if (intent.keyword) {
-    const k = intent.keyword.toLowerCase();
-    list = list.filter((it) => {
-      const name = (it?.name || it?.product_name || "").toLowerCase();
-      const strain = (it?.strain || it?.strain_name || "").toLowerCase();
-      return name.includes(k) || strain.includes(k);
-    });
-  }
-
-  // Category filter
-  if (intent.category) {
-    const c = intent.category;
-    list = list.filter((it) => {
-      const blob = (
-        (it?.category || "") +
-        " " +
-        (it?.product_category || "") +
-        " " +
-        (it?.sub_category || "") +
-        " " +
-        (it?.type || "") +
-        " " +
-        (it?.leaf_category || "")
-      )
-        .toString()
-        .toLowerCase();
-
-      if (c === "flower") {
-        return (
-          /\bflower\b/.test(blob) ||
-          /\bpre[-\s]?pack\b/.test(blob) ||
-          /\bsmalls?\b/.test(blob)
-        );
-      }
-      if (c === "vape") {
-        return (
-          /\bvape\b/.test(blob) ||
-          /\bcartridge\b/.test(blob) ||
-          /\bcart\b/.test(blob) ||
-          /\bpod\b/.test(blob) ||
-          /\bdisposable\b/.test(blob)
-        );
-      }
-      if (c === "pre-roll") {
-        return (
-          /\bpre[-\s]?roll\b/.test(blob) ||
-          /\bpre[-\s]?rolls\b/.test(blob) ||
-          /\bjoint\b/.test(blob)
-        );
-      }
-      if (c === "edible") {
-        return (
-          /\bedible\b/.test(blob) ||
-          /\bgumm(y|ies)\b/.test(blob) ||
-          /\bchocolate\b/.test(blob) ||
-          /\bcookie\b/.test(blob) ||
-          /\bdrink\b/.test(blob) ||
-          /\bbeverage\b/.test(blob)
-        );
-      }
-      return true;
-    });
-  }
-
-  return list;
-}
-
-function collectStrainCount(items = []) {
-  const set = new Set();
-  for (const it of items) {
-    const rawName =
-      (it?.strain ||
-        it?.strain_name ||
-        it?.name ||
-        it?.product_name ||
-        "") + "";
-    const cleaned = rawName
-      .replace(
-        /\b(\d+(?:\.\d+)?g|eighth|half|quarter|ounce|1\/8|1\/4|1\/2|pack|pk|pre[-\s]?rolls?)\b/gi,
-        ""
-      )
-      .trim()
-      .toLowerCase();
-    if (cleaned) set.add(cleaned);
-  }
-  return set.size || items.length;
-}
-
-function formatPriceRangeFromItems(items = []) {
-  const prices = items
-    .map((it) => extractJanePriceCents(it))
-    .filter((v) => typeof v === "number");
-
-  if (!prices.length) return "";
-
-  prices.sort((a, b) => a - b);
-  const low = prices[0] / 100;
-  const high = prices[prices.length - 1] / 100;
-
-  const lowStr = low.toFixed(2).replace(/\.00$/, "");
-  const highStr = high.toFixed(2).replace(/\.00$/, "");
-
-  if (low === high) {
-    return ` Prices are about $${lowStr} before tax.`;
-  }
-  return ` Prices start around $${lowStr} and go up to about $${highStr} before tax.`;
-}
-
-function detectAvailableCategories(items = []) {
-  const cats = new Set();
-  for (const it of items) {
-    const blob = (
-      (it?.category || "") +
-      " " +
-      (it?.product_category || "") +
-      " " +
-      (it?.sub_category || "") +
-      " " +
-      (it?.type || "") +
-      " " +
-      (it?.leaf_category || "")
-    )
-      .toString()
-      .toLowerCase();
-
-    if (/\bflower\b/.test(blob)) cats.add("flower");
-    if (/\b(vape|cartridge|cart|pod|disposable)\b/.test(blob)) cats.add("vape");
-    if (/\b(pre[-\s]?roll|joint)\b/.test(blob)) cats.add("pre-roll");
-    if (/\b(edible|gumm(y|ies)|chocolate|cookie|drink|beverage)\b/.test(blob))
-      cats.add("edible");
-  }
-  return Array.from(cats);
-}
-
-/**
- * Turn Jane data + parsed intent into a spoken summary:
- * - honest yes/no
- * - # of strains/options
- * - price range from cheapest
- */
-function summarizeBrandInventory(intent, rawItems = []) {
-  const brandLabel = intent.brand || intent.keyword || "that brand";
-  const allItems = Array.isArray(rawItems) ? rawItems : [];
-
-  console.log("=== Jane inventory debug ===");
-  console.log("User intent:", intent);
-  console.log("Total items returned from Jane:", allItems.length);
-
-  const brandOnly = filterJaneItemsByIntent(allItems, { ...intent, category: null });
-  console.log("Items for brand-only filter:", brandOnly.length);
-
-  const matched = filterJaneItemsByIntent(allItems, intent);
-  console.log("Items after brand + category filter:", matched.length);
-
-  const hasAnyBrandItems = intent.brand
-    ? brandOnly.length > 0
-    : matched.length > 0;
-
-  // No items at all for that brand/keyword
-  if (!hasAnyBrandItems) {
-    if (!allItems.length) {
-      return `I’m not seeing any items come back from our menu system right now. It might be updating. Please check Crystal Nugs dot com for the live menu or ask a budtender.`;
-    }
-
-    return `I’m not seeing a clear match for ${brandLabel} in our menu data right now, but inventory can change fast. Please double check on Crystal Nugs dot com or with a budtender for the most accurate info.`;
-  }
-
-  // If they asked for a category but our category filter wiped everything out,
-  // fall back to brand-only so we don't lie and say you have zero.
-  let workingList;
-  if (intent.category && matched.length === 0) {
-    console.log("Category filter too strict; falling back to brand-only results.");
-    workingList = brandOnly;
-  } else if (brandOnly.length) {
-    workingList = intent.category ? matched : brandOnly;
-  } else if (matched.length) {
-    workingList = matched;
-  } else {
-    workingList = allItems;
-  }
-
-  const strainCount = collectStrainCount(workingList);
-  const catLabel = intent.category ? humanCategory(intent.category) : "items";
-  const priceLine = formatPriceRangeFromItems(workingList);
-
-  return `Yes — we have about ${strainCount} ${catLabel} from ${brandLabel} in stock.${priceLine} For exact strains and live inventory, go to Crystal Nugs dot com and search for ${brandLabel}.`;
-}
-
-// ---------- Utils ----------
-function safeSend(ws, obj) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  try {
-    ws.send(JSON.stringify(obj));
-  } catch (e) {
-    console.error("WS send error:", e.message);
-  }
-}
-
-function escapeXml(str = "") {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-/** Speak ZIP as hyphenated digits: "95827" -> "9-5-8-2-7" */
-function speakZip(zip = "") {
-  const z = String(zip).replace(/[^\d]/g, "").slice(0, 5);
-  return z.split("").join("-");
-}
-
-/** Extract first 5-digit ZIP from text */
-function extractZip(text = "") {
-  const m = String(text).match(/\b\d{5}\b/);
-  return m ? m[0] : null;
-}
-
-/** Lookup delivery record by ZIP */
-function deliveryByZip(zip) {
-  return DELIVERY_TABLE.find((r) => r.zip === zip) || null;
-}
-
-/** Format money; 40 -> $40, 1.99 -> $1.99 */
-function formatMoney(n) {
-  const num = Number(n);
-  if (Number.isNaN(num)) return String(n);
-  const s = num.toFixed(2);
-  return s.endsWith(".00") ? `$${parseInt(s, 10)}` : `$${s}`;
-}
-
-/** Compute ETA window if not set, based on minimum (heuristic) */
-function computeEtaWindow(minimum) {
-  const m = Number(minimum) || 0;
-  if (m <= 40) return "30–60 minutes";
-  if (m <= 50) return "45–90 minutes";
-  if (m <= 70) return "60–120 minutes";
-  if (m <= 90) return "75–150 minutes";
-  if (m <= 110) return "90–180 minutes";
-  return "120–240 minutes";
-}
-
-/** Convert crystalnugs.com + emails to friendly spoken phrases */
-function toSpokenText(text = "") {
-  if (!text) return "";
-  let out = String(text);
-  out = out.replace(
-    /https?:\/\/(www\.)?crystalnugs\.com\/?/gi,
-    "Crystal Nugs dot com"
-  );
-  out = out.replace(/\bwww\.crystalnugs\.com\b/gi, "Crystal Nugs dot com");
-  out = out.replace(/\bcrystalnugs\.com\b/gi, "Crystal Nugs dot com");
-  out = out.replace(
-    /\b([a-z0-9._%+-]+)@crystalnugs\.com\b/gi,
-    (_m, user) => `${user} at crystal nugs dot com`
-  );
-  out = out.replace(/https?:\/\//gi, "");
-  return out;
-}
-
-/** Venue label helper for natural phrasing */
-function venueLabel({ mentionsHotel, mentionsVenue }) {
-  if (mentionsHotel && mentionsVenue)
-    return "hotels, motels, restaurants, bars, and truck stops";
-  if (mentionsHotel) return "hotels and motels";
-  return "restaurants, bars, and truck stops";
-}
-
-/** Brand voice (plain or SSML) */
-function brandVoice(raw = "") {
-  const cleaned = toSpokenText(raw).trim();
-
-  if (!USE_SSML) {
-    return cleaned
-      .replace(/\s+/g, " ")
-      .replace(/\s-\s/g, " — ")
-      .replace(/:\s+/g, ": ")
-      .replace(/,{2,}/g, ",")
-      .replace(/\.\s*\./g, ".")
-      .replace(/\s{2,}/g, " ");
-  }
-
-  const parts = cleaned
-    .split(/(?<=[\.\?!])\s+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  const ssmlBody = parts.map((s) => emphasisLead(s, 3)).join('<break time="240ms"/>');
-
-  return `<speak>
-    <prosody rate="fast" pitch="+8%" volume="medium">
-      ${ssmlBody}
-    </prosody>
-  </speak>`;
-}
-
-function emphasisLead(sentence = "", n = 3) {
-  const tokens = sentence.split(/\s+/).filter(Boolean);
-  const lead = tokens.slice(0, n).join(" ");
-  const tail = tokens.slice(n).join(" ");
-  const leadEsc = escapeSSML(lead);
-  const tailEsc = escapeSSML(tail);
-  return tail
-    ? `<emphasis level="moderate">${leadEsc}</emphasis> ${tailEsc}`
-    : `<emphasis level="moderate">${leadEsc}</emphasis>`;
-}
-
-function escapeSSML(str = "") {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
+  if (intent.keyword)
