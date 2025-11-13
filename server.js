@@ -27,7 +27,8 @@ const TRANSFER_NUMBER =
   "+19167019777"; // Crystal Nugs store line in E.164
 
 // Kill-switch for Jane lookups while you sort out POS/allowlisting if needed
-const LOOKUPS_ON = String(process.env.JANE_LOOKUPS_ENABLED || "true").toLowerCase() === "true";
+const LOOKUPS_ON =
+  String(process.env.JANE_LOOKUPS_ENABLED || "true").toLowerCase() === "true";
 
 // ---------- URL + phone helpers ----------
 function normalizeBaseUrl(u) {
@@ -279,7 +280,7 @@ app.get("/whoami", async (_req, res) => {
 // Quick Jane test — just pull first 3 products for this merchant
 app.get("/jane/test", async (_req, res) => {
   try {
-    const items = await janeMenuSearch("", 3); // no search term → raw products
+    const items = await janeMenuSearch("", 3); // first page products
     res.json({ ok: true, sample: items });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -337,7 +338,9 @@ wss.on("error", (err) => {
 });
 
 wss.on("connection", async (twilioWS) => {
-  console.log("Twilio connected to Conversation Relay (HTTPS Chat + local intents)");
+  console.log(
+    "Twilio connected to Conversation Relay (HTTPS Chat + local intents)"
+  );
 
   let currentCallSid = null;
 
@@ -363,7 +366,7 @@ wss.on("connection", async (twilioWS) => {
       console.log("Caller said:", userText);
 
       // -------------------------
-      // 0) Product lookup via Jane POS v3 (merchant products) BEFORE local intents
+      // 0) Product lookup via Jane POS v3 BEFORE local intents
       // -------------------------
       const productIntent = detectProductQuery(q);
       if (productIntent) {
@@ -381,13 +384,8 @@ wss.on("connection", async (twilioWS) => {
         const to = setTimeout(() => ac.abort(), 7000);
 
         try {
-          const searchTerm =
-            productIntent.brand ||
-            productIntent.keyword ||
-            productIntent.rawText ||
-            "";
-
-          const items = await janeMenuSearch(searchTerm, 50, ac.signal);
+          // We ignore q on the Jane side now and always filter locally
+          const items = await janeMenuSearch("", 100, ac.signal);
           clearTimeout(to);
 
           const reply = summarizeBrandInventory(productIntent, items);
@@ -439,7 +437,11 @@ wss.on("connection", async (twilioWS) => {
       }
 
       if (local) {
-        safeSend(twilioWS, { type: "text", token: brandVoice(local), last: true });
+        safeSend(twilioWS, {
+          type: "text",
+          token: brandVoice(local),
+          last: true,
+        });
         return;
       }
 
@@ -600,7 +602,9 @@ Returns: ${RETURNS}
 
   if (!resp.ok) {
     const errText = await resp.text().catch(() => "");
-    throw new Error(`OpenAI ${resp.status} ${resp.statusText}: ${errText.slice(0, 500)}`);
+    throw new Error(
+      `OpenAI ${resp.status} ${resp.statusText}: ${errText.slice(0, 500)}`
+    );
   }
 
   const data = await resp.json().catch(() => null);
@@ -621,14 +625,15 @@ function canonicalJaneBase(input) {
   const def = "https://pos.iheartjane.com";
   let u = String(input || "").trim().toLowerCase();
   if (!u) return def;
-  if (u.includes("iheartjane.com") && !u.includes("pos.iheartjane.com")) return def;
+  if (u.includes("iheartjane.com") && !u.includes("pos.iheartjane.com"))
+    return def;
   if (!/^https?:\/\//.test(u)) u = `https://${u}`;
   return u.replace(/\/+$/, "");
 }
 
-// POS v3 Merchant Products endpoint:
+// POS v3 Merchant Products endpoint (local filtering, no server-side q):
 // GET /api/v3/merchants/{merchant_id}/products?page[size]=N
-async function janeMenuSearch(q, limit = 6, signal) {
+async function janeMenuSearch(_q, limit = 100, signal) {
   const base = canonicalJaneBase(
     process.env.JANE_API_BASE || "https://pos.iheartjane.com"
   );
@@ -640,13 +645,6 @@ async function janeMenuSearch(q, limit = 6, signal) {
 
   const url = new URL(`/api/v3/merchants/${merchantId}/products`, base);
   url.searchParams.set("page[size]", String(limit));
-
-  // Hints (some implementations honor these)
-  if (q) {
-    const trimmed = q.trim();
-    url.searchParams.set("q", trimmed);
-    url.searchParams.set("search", trimmed);
-  }
 
   const resp = await fetch(url.toString(), {
     headers: {
@@ -676,35 +674,26 @@ async function janeMenuSearch(q, limit = 6, signal) {
   return items;
 }
 
-function formatJaneItems(items = [], max = 3) {
-  const picks = items.slice(0, max);
-  if (!picks.length) return null;
-  const parts = picks.map((it) => {
-    const brand = it?.brand?.name || it?.brand_name || "";
-    const name = (it?.name || it?.product_name || "pre-roll").toString();
-    const cents =
-      it?.price?.price ??
-      it?.price ??
-      it?.variants?.[0]?.price?.price ??
-      it?.variants?.[0]?.price ??
-      null;
-    const price = moneyFromCents(cents);
-    const brandPart = brand ? `${brand} ` : "";
-    return `${brandPart}${name} at ${price}`;
-  });
-  return parts.join(", ");
-}
-
 // ---------- Inventory + brand/category detection ----------
+
+const CORE_ALWAYS_BRANDS = [
+  "Maven",
+  "Maven Genetics",
+  "STIIIZY",
+  "Raw Garden",
+  "Uncle Larry",
+  "Uncle Larry's",
+];
 
 // Very light detector — focuses on brand + “carry/have/stock/sell” + optional category
 function detectProductQuery(text = "") {
   const raw = String(text || "");
   const t = raw.toLowerCase();
 
-  const askedCarry = /\b(carry|have|stock|sell|got|do you (guys )?(have|carry|stock|sell)|y['’]?all (got|have))\b/.test(
-    t
-  );
+  const askedCarry =
+    /\b(carry|have|stock|sell|got|do you (guys )?(have|carry|stock|sell)|y['’]?all (got|have))\b/.test(
+      t
+    );
 
   // Category detection
   let category = null;
@@ -727,6 +716,7 @@ function detectProductQuery(text = "") {
     { re: /\bmaven(\s+genetics)?\b/i, brand: "Maven" },
     { re: /\bstii?izy\b/i, brand: "STIIIZY" },
     { re: /\braw\s+garden\b/i, brand: "Raw Garden" },
+    { re: /\buncle\s+larry'?s?\b/i, brand: "Uncle Larry" },
   ];
 
   for (const { re, brand } of brandMap) {
@@ -979,7 +969,7 @@ function detectAvailableCategories(items = []) {
 
 /**
  * Turn Jane data + parsed intent into a spoken summary:
- * - honest yes/no
+ * - honest yes/no (with special handling for core brands)
  * - # of strains/options
  * - price range from cheapest
  */
@@ -1001,8 +991,24 @@ function summarizeBrandInventory(intent, rawItems = []) {
     ? brandOnly.length > 0
     : matched.length > 0;
 
+  const isCoreBrand =
+    intent.brand &&
+    CORE_ALWAYS_BRANDS.some(
+      (b) => b.toLowerCase() === intent.brand.toLowerCase()
+    );
+
   // No items at all for that brand/keyword
   if (!hasAnyBrandItems) {
+    if (isCoreBrand) {
+      // You know you carry this, even if Jane didn't return it for this page/search
+      if (intent.category) {
+        const catLabel = humanCategory(intent.category);
+        return `We do carry ${brandLabel} ${catLabel}, but I’m not seeing them in our live menu data at this moment. Inventory updates often. For exact options and pricing, please check Crystal Nugs dot com or ask a budtender in-store.`;
+      }
+      return `We do carry ${brandLabel}, but I’m not seeing it in our live menu snapshot right now. Inventory updates often. For exact options and pricing, please check Crystal Nugs dot com or ask a budtender in-store.`;
+    }
+
+    // Non-core brands: be honest about not finding them
     if (!allItems.length) {
       return `I’m not seeing any items come back from our menu system right now. It might be updating. Please check Crystal Nugs dot com for the live menu or ask a budtender.`;
     }
