@@ -1,4 +1,4 @@
-// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F) + Jane POS v3 Merchant Products + Live Transfer
+// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F) + Jane POS v3 Merchant/Store Products + Live Transfer
 // ConversationRelay + Product search (iHeartJane POS v3) + Local Intents (ZIP-aware mins/fees/ETA) + Venue answers + OpenAI fallback
 // Includes: URL/email sanitizer, SSML brand voice (optional), robust logging, in-call transfer
 
@@ -249,7 +249,7 @@ app.get("/jane/debug", async (_req, res) => {
   const base = canonicalJaneBase(
     process.env.JANE_API_BASE || "https://pos.iheartjane.com"
   );
-  const merchantId = process.env.JANE_MERCHANT_ID || "724"; // default 724
+  const merchantId = process.env.JANE_MERCHANT_ID || "56";
   const storeId = process.env.JANE_STORE_ID || "100";
   const tokenPresent = !!process.env.JANE_API_TOKEN;
   const tokenLength = process.env.JANE_API_TOKEN
@@ -276,7 +276,7 @@ app.get("/whoami", async (_req, res) => {
   }
 });
 
-// Quick Jane test — just pull first 3 products for this merchant
+// Quick Jane test — just pull first 3 products for this merchant/store
 app.get("/jane/test", async (_req, res) => {
   try {
     const items = await janeMenuSearch("", 3); // no search term → raw products
@@ -290,7 +290,7 @@ app.get("/jane/test", async (_req, res) => {
 app.post("/twilio/voice", (req, res) => {
   const wsUrl = `wss://${req.get("host")}/relay`;
   const greeting =
-    "Welcome to Crystal Nugs Sacramento. I can help with delivery areas and minimums, store hours, address, frequently asked questions, or any other questions. What can I do for you today?";
+    "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?";
 
   const twiml = `<Response>
       <Connect>
@@ -363,7 +363,7 @@ wss.on("connection", async (twilioWS) => {
       console.log("Caller said:", userText);
 
       // -------------------------
-      // 0) Product lookup via Jane POS v3 (merchant products) BEFORE local intents
+      // 0) Product lookup via Jane POS v3 BEFORE local intents
       // -------------------------
       const productIntent = detectProductQuery(q);
       if (productIntent) {
@@ -626,54 +626,92 @@ function canonicalJaneBase(input) {
   return u.replace(/\/+$/, "");
 }
 
-// POS v3 Merchant Products endpoint:
-// GET /api/v3/merchants/{merchant_id}/products?page[size]=N
+// POS v3 Merchant / Store Products endpoint:
+// Prefer merchant-level products; fall back to store/venue products if empty.
 async function janeMenuSearch(q, limit = 6, signal) {
   const base = canonicalJaneBase(
     process.env.JANE_API_BASE || "https://pos.iheartjane.com"
   );
+
   const merchantId = process.env.JANE_MERCHANT_ID || "56";
+  const storeId = process.env.JANE_STORE_ID || "100"; // Jane calls this a "venue"
   const token = process.env.JANE_API_TOKEN;
+
   if (!token || !merchantId) {
     throw new Error("Missing Jane POS env vars (JANE_API_TOKEN, JANE_MERCHANT_ID)");
   }
 
-  const url = new URL(`/api/v3/merchants/${merchantId}/products`, base);
-  url.searchParams.set("page[size]", String(limit));
-
-  // Hints (some implementations honor these)
+  const searchParams = new URLSearchParams();
+  searchParams.set("page[size]", String(limit));
   if (q) {
     const trimmed = q.trim();
-    url.searchParams.set("q", trimmed);
-    url.searchParams.set("search", trimmed);
+    searchParams.set("q", trimmed);
+    searchParams.set("search", trimmed);
   }
 
-  const resp = await fetch(url.toString(), {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/json",
-      "User-Agent": "CrystalNugs-VoiceBot/1.0",
-    },
-    signal,
-  });
+  async function fetchProducts(path) {
+    const url = new URL(path, base);
+    url.search = searchParams.toString();
 
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    if (resp.status === 401) {
-      throw new Error("Jane 401: Invalid API token for POS v3.");
+    const resp = await fetch(url.toString(), {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        "User-Agent": "CrystalNugs-VoiceBot/1.0",
+      },
+      signal,
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      if (resp.status === 401) {
+        throw new Error("Jane 401: Invalid API token for POS v3.");
+      }
+      if (resp.status === 403 || /cloudflare/i.test(text)) {
+        throw new Error(
+          "Jane API blocked (403). Ask your Jane rep to allowlist your server IP and confirm POS API scopes."
+        );
+      }
+      throw new Error(`Jane ${resp.status}: ${text.slice(0, 300)}`);
     }
-    if (resp.status === 403 || /cloudflare/i.test(text)) {
-      throw new Error(
-        "Jane API blocked (403). Ask your Jane rep to allowlist your server IP and confirm POS API scopes."
+
+    const data = await resp.json().catch(() => null);
+    let items = Array.isArray(data) ? data : data?.data || data?.items || [];
+    return items || [];
+  }
+
+  let items = [];
+
+  // 1) Try merchant-level products
+  try {
+    items = await fetchProducts(`/api/v3/merchants/${merchantId}/products`);
+    console.log(
+      `Jane merchant products (/merchants/${merchantId}/products) count:`,
+      items.length
+    );
+  } catch (e) {
+    console.error("Jane merchant products call failed:", e.message);
+  }
+
+  // 2) If merchant-level is empty, try store/venue-level products
+  if ((!items || !items.length) && storeId) {
+    try {
+      const storeItems = await fetchProducts(
+        `/api/v3/merchants/${merchantId}/stores/${storeId}/products`
       );
+      console.log(
+        `Jane store products (/merchants/${merchantId}/stores/${storeId}/products) count:`,
+        storeItems.length
+      );
+      if (storeItems && storeItems.length) {
+        items = storeItems;
+      }
+    } catch (e) {
+      console.error("Jane store products call failed:", e.message);
     }
-    throw new Error(`Jane ${resp.status}: ${text.slice(0, 300)}`);
   }
 
-  let data = await resp.json();
-  let items = Array.isArray(data) ? data : data?.data || data?.items || [];
-
-  return items;
+  return items || [];
 }
 
 function formatJaneItems(items = [], max = 3) {
@@ -682,12 +720,7 @@ function formatJaneItems(items = [], max = 3) {
   const parts = picks.map((it) => {
     const brand = it?.brand?.name || it?.brand_name || "";
     const name = (it?.name || it?.product_name || "pre-roll").toString();
-    const cents =
-      it?.price?.price ??
-      it?.price ??
-      it?.variants?.[0]?.price?.price ??
-      it?.variants?.[0]?.price ??
-      null;
+    const cents = extractJanePriceCents(it);
     const price = moneyFromCents(cents);
     const brandPart = brand ? `${brand} ` : "";
     return `${brandPart}${name} at ${price}`;
