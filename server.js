@@ -1,5 +1,5 @@
-// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F) + Jane POS v3 Inventories
-// ConversationRelay + Brand / product search + Local Intents (ZIP-aware mins/fees/ETA) + Venue answers + OpenAI fallback
+// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F) + Jane Product Lookup + Live Transfer
+// ConversationRelay + Product search (iHeartJane) + Local Intents (ZIP-aware mins/fees/ETA) + Venue answers + OpenAI fallback
 
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
@@ -17,26 +17,21 @@ app.use(bodyParser.json());
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini";
+const USE_SSML = String(process.env.CN_USE_SSML || "false").toLowerCase() === "true";
 
-// If you ever want SSML later, we can re-add it. For now, keep responses plain.
-const USE_SSML = false;
-
-// Prefer explicit transfer env; fall back to old variable; final fallback is store line.
 const TRANSFER_NUMBER =
   process.env.TWILIO_TRANSFER_NUMBER ||
   process.env.TWILIO_VOICE_FALLBACK ||
-  "+19167019777"; // Crystal Nugs store line in E.164
+  "+19167019777"; // Crystal Nugs store line (E.164)
 
-// Kill-switch for Jane lookups while you sort out POS/allowlisting if needed
-const LOOKUPS_ON =
+const JANE_LOOKUPS_ENABLED =
   String(process.env.JANE_LOOKUPS_ENABLED || "true").toLowerCase() === "true";
 
 // ---------- URL + phone helpers ----------
-
 function normalizeBaseUrl(u) {
   let s = String(u || "").trim();
   if (!s) return "";
-  if (!/^https?:\/\//i.test(s)) s = "https://" + s;
+  if (!/^https?:\/\//i.test(s)) s = `https://${s}`;
   s = s.replace(/^https?:\/\/https?:\/\//i, "https://");
   s = s.replace(/\/+$/g, "");
   return s;
@@ -47,9 +42,9 @@ const BASE_URL = normalizeBaseUrl(
 );
 
 function absUrl(path = "/") {
-  const base = BASE_URL || "https://crystal-nugs-voice-ai.onrender.com";
-  const p = path.startsWith("/") ? path : "/" + path;
-  const url = base + p;
+  const base = BASE_URL;
+  const p = path.startsWith("/") ? path : `/${path}`;
+  const url = `${base}${p}`;
   return url.replace(/^https?:\/\/https?:\/\//i, "https://");
 }
 
@@ -62,19 +57,17 @@ function speakPhone(e164 = "+19167019777") {
       ? [digits.slice(0, 3), digits.slice(3, 6), digits.slice(6)]
       : [digits];
   return parts
-    .map((seg) => seg.split("").join("-") + ",")
+    .map((seg, i) => seg.split("").join("-") + (i < parts.length - 1 ? "," : ""))
     .join(" ")
-    .replace(/,\s*$/, "");
+    .trim();
 }
 
 // ---------- Live transfer (Calls API) ----------
-
 async function transferLiveCall(callSid) {
   if (!callSid) throw new Error("Missing CallSid for transfer");
   const ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
   const AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-  if (!ACCOUNT_SID || !AUTH_TOKEN)
-    throw new Error("Missing Twilio creds (Account SID/Auth Token)");
+  if (!ACCOUNT_SID || !AUTH_TOKEN) throw new Error("Missing Twilio creds (Account SID/Auth Token)");
 
   const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
   const TRANSFER_URL = absUrl("/twilio/transfer");
@@ -84,7 +77,6 @@ async function transferLiveCall(callSid) {
 }
 
 // ===== Business Facts (env-driven; update in Render → Environment) =====
-
 const HOURS =
   process.env.CN_HOURS ||
   "Our dispensary is open daily from 9:00 AM to 9:00 PM, and we take delivery orders from 8:30 AM to 8:30 PM.";
@@ -145,102 +137,97 @@ const MAP_URL =
   process.env.CN_DIRECTIONS_URL ||
   "Crystal Nugs is at 2300 J Street in Midtown Sacramento — the neon green building on the corner of J and 23rd.";
 
-// Venues policy (allowed when asked explicitly)
+// Venues policy (allowed when asked)
 const DELIVERY_PLACES =
   process.env.CN_DELIVERY_PLACES ||
-  "Yes — we deliver to hotels, motels, restaurants, bars, and truck stops within our service area. Please have a valid government ID (21+) and the name on the order present at handoff. For hotels, include the registered guest and room number; we can meet at the lobby or front desk if required. For restaurants, bars, and truck stops, we’ll meet at the main entrance, host stand, or a safe, well-lit area.";
+  "Yes — we deliver to hotels, motels, restaurants, bars, and truck stops within our service area. Please have a valid government ID (21+) and the name on the order present at handoff. For hotels, include the registered guest and room number; we can meet at the lobby or front desk if required. For restaurants, bars, or truck stops, we’ll meet at the main entrance, host stand, or a designated safe area. Payment: cash or JanePay.";
 
 // ===== Delivery Minimum + Fee + ETA Window table =====
-
 const DEFAULT_DELIVERY_TABLE = [
-  { zip: "95811", minimum: 40, fee: 1.99, window: "30–60 minutes" },
-  { zip: "95814", minimum: 40, fee: 1.99, window: "30–60 minutes" },
-  { zip: "95815", minimum: 40, fee: 1.99, window: "30–60 minutes" },
-  { zip: "95816", minimum: 40, fee: 1.99, window: "30–60 minutes" },
-  { zip: "95817", minimum: 40, fee: 1.99, window: "45–75 minutes" },
-  { zip: "95818", minimum: 40, fee: 1.99, window: "45–75 minutes" },
-  { zip: "95819", minimum: 40, fee: 1.99, window: "45–75 minutes" },
-  { zip: "95820", minimum: 40, fee: 1.99, window: "45–75 minutes" },
-  { zip: "95821", minimum: 40, fee: 1.99, window: "45–75 minutes" },
-  { zip: "95822", minimum: 40, fee: 1.99, window: "45–75 minutes" },
-  { zip: "95823", minimum: 40, fee: 1.99, window: "45–75 minutes" },
-  { zip: "95824", minimum: 40, fee: 1.99, window: "45–75 minutes" },
-  { zip: "95825", minimum: 40, fee: 1.99, window: "45–75 minutes" },
-  { zip: "95826", minimum: 40, fee: 1.99, window: "45–75 minutes" },
-  { zip: "95827", minimum: 40, fee: 1.99, window: "45–75 minutes" },
-  { zip: "95828", minimum: 40, fee: 1.99, window: "45–75 minutes" },
-  { zip: "95829", minimum: 50, fee: 1.99, window: "60–120 minutes" },
-  { zip: "95605", minimum: 40, fee: 1.99, window: "45–75 minutes" },
-  { zip: "95691", minimum: 40, fee: 1.99, window: "45–75 minutes" },
-  { zip: "95798", minimum: 40, fee: 1.99, window: "45–75 minutes" },
-  { zip: "95799", minimum: 40, fee: 1.99, window: "45–75 minutes" },
-  { zip: "95673", minimum: 50, fee: 1.99, window: "60–120 minutes" },
-  { zip: "95626", minimum: 50, fee: 1.99, window: "60–120 minutes" },
-  { zip: "95652", minimum: 50, fee: 1.99, window: "60–120 minutes" },
-  { zip: "95838", minimum: 40, fee: 1.99, window: "45–90 minutes" },
-  { zip: "95628", minimum: 50, fee: 1.99, window: "60–120 minutes" },
-  { zip: "95670", minimum: 60, fee: 1.99, window: "75–150 minutes" },
-  { zip: "95655", minimum: 60, fee: 1.99, window: "75–150 minutes" },
-  { zip: "95683", minimum: 125, fee: 1.99, window: "120–240 minutes" },
-  { zip: "95741", minimum: 50, fee: 1.99, window: "60–120 minutes" },
-  { zip: "95742", minimum: 80, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95610", minimum: 60, fee: 1.99, window: "75–150 minutes" },
-  { zip: "95611", minimum: 40, fee: 1.99, window: "45–90 minutes" },
-  { zip: "95621", minimum: 50, fee: 1.99, window: "60–120 minutes" },
-  { zip: "95841", minimum: 50, fee: 1.99, window: "60–120 minutes" },
-  { zip: "95608", minimum: 50, fee: 1.99, window: "60–120 minutes" },
-  { zip: "95609", minimum: 40, fee: 1.99, window: "45–90 minutes" },
-  { zip: "95660", minimum: 50, fee: 1.99, window: "60–120 minutes" },
-  { zip: "95842", minimum: 50, fee: 1.99, window: "60–120 minutes" },
-  { zip: "95830", minimum: 50, fee: 1.99, window: "60–120 minutes" },
-  { zip: "95831", minimum: 40, fee: 1.99, window: "45–90 minutes" },
-  { zip: "95832", minimum: 40, fee: 1.99, window: "45–90 minutes" },
-  { zip: "95833", minimum: 40, fee: 1.99, window: "45–90 minutes" },
-  { zip: "95834", minimum: 40, fee: 1.99, window: "45–90 minutes" },
-  { zip: "95835", minimum: 40, fee: 1.99, window: "45–90 minutes" },
-  { zip: "95836", minimum: 50, fee: 1.99, window: "60–120 minutes" },
-  { zip: "95837", minimum: 50, fee: 1.99, window: "60–120 minutes" },
-  { zip: "95843", minimum: 50, fee: 1.99, window: "60–120 minutes" },
-  { zip: "95864", minimum: 40, fee: 1.99, window: "45–90 minutes" },
-  { zip: "95695", minimum: 65, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95776", minimum: 70, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95616", minimum: 65, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95617", minimum: 65, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95618", minimum: 65, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95662", minimum: 70, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95668", minimum: 60, fee: 1.99, window: "75–150 minutes" },
-  { zip: "95630", minimum: 80, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95671", minimum: 80, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95763", minimum: 80, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95762", minimum: 100, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95677", minimum: 80, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95678", minimum: 80, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95747", minimum: 80, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95765", minimum: 80, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95650", minimum: 100, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95661", minimum: 70, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95746", minimum: 60, fee: 1.99, window: "75–150 minutes" },
-  { zip: "95648", minimum: 80, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95624", minimum: 80, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95757", minimum: 80, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95758", minimum: 70, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95759", minimum: 70, fee: 1.99, window: "90–180 minutes" },
-  { zip: "95632", minimum: 80, fee: 3.49, window: "90–180 minutes" },
-  { zip: "95612", minimum: 40, fee: 1.99, window: "45–90 minutes" },
-  { zip: "95693", minimum: 125, fee: 3.49, window: "120–240 minutes" },
-  { zip: "95639", minimum: 80, fee: 3.49, window: "120–240 minutes" },
-  { zip: "95672", minimum: 80, fee: 1.99, window: "90–180 minutes" },
+  { zip:"95811", minimum:40, fee:1.99, window:"30–60 minutes" },
+  { zip:"95814", minimum:40, fee:1.99, window:"30–60 minutes" },
+  { zip:"95815", minimum:40, fee:1.99, window:"30–60 minutes" },
+  { zip:"95816", minimum:40, fee:1.99, window:"30–60 minutes" },
+  { zip:"95817", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95818", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95819", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95820", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95821", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95822", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95823", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95824", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95825", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95826", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95827", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95828", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95829", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95605", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95691", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95798", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95799", minimum:40, fee:1.99, window:"45–75 minutes" },
+  { zip:"95673", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95626", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95652", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95838", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95628", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95670", minimum:60, fee:1.99, window:"75–150 minutes" },
+  { zip:"95655", minimum:60, fee:1.99, window:"75–150 minutes" },
+  { zip:"95683", minimum:125, fee:1.99, window:"120–240 minutes" },
+  { zip:"95741", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95742", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95610", minimum:60, fee:1.99, window:"75–150 minutes" },
+  { zip:"95611", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95621", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95841", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95608", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95609", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95660", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95842", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95830", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95831", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95832", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95833", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95834", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95835", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95836", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95837", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95843", minimum:50, fee:1.99, window:"60–120 minutes" },
+  { zip:"95864", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95695", minimum:65, fee:1.99, window:"90–180 minutes" },
+  { zip:"95776", minimum:70, fee:1.99, window:"90–180 minutes" },
+  { zip:"95616", minimum:65, fee:1.99, window:"90–180 minutes" },
+  { zip:"95617", minimum:65, fee:1.99, window:"90–180 minutes" },
+  { zip:"95618", minimum:65, fee:1.99, window:"90–180 minutes" },
+  { zip:"95662", minimum:70, fee:1.99, window:"90–180 minutes" },
+  { zip:"95668", minimum:60, fee:1.99, window:"75–150 minutes" },
+  { zip:"95630", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95671", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95763", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95762", minimum:100, fee:1.99, window:"90–180 minutes" },
+  { zip:"95677", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95678", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95747", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95765", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95650", minimum:100, fee:1.99, window:"90–180 minutes" },
+  { zip:"95661", minimum:70, fee:1.99, window:"90–180 minutes" },
+  { zip:"95746", minimum:60, fee:1.99, window:"75–150 minutes" },
+  { zip:"95648", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95624", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95757", minimum:80, fee:1.99, window:"90–180 minutes" },
+  { zip:"95758", minimum:70, fee:1.99, window:"90–180 minutes" },
+  { zip:"95759", minimum:70, fee:1.99, window:"90–180 minutes" },
+  { zip:"95632", minimum:80, fee:3.49, window:"90–180 minutes" },
+  { zip:"95612", minimum:40, fee:1.99, window:"45–90 minutes" },
+  { zip:"95693", minimum:125, fee:3.49, window:"120–240 minutes" },
+  { zip:"95639", minimum:80, fee:3.49, window:"120–240 minutes" },
+  { zip:"95672", minimum:80, fee:1.99, window:"90–180 minutes" }
 ];
 
 let DELIVERY_TABLE = DEFAULT_DELIVERY_TABLE;
 try {
-  const override = process.env.CN_DELIVERY_TABLE
-    ? JSON.parse(process.env.CN_DELIVERY_TABLE)
-    : null;
+  const override = process.env.CN_DELIVERY_TABLE ? JSON.parse(process.env.CN_DELIVERY_TABLE) : null;
   if (Array.isArray(override) && override.length) DELIVERY_TABLE = override;
-} catch {
-  // keep default
-}
+} catch { /* keep default */ }
 
 DELIVERY_TABLE = DELIVERY_TABLE.map((r) => ({
   ...r,
@@ -248,65 +235,66 @@ DELIVERY_TABLE = DELIVERY_TABLE.map((r) => ({
 }));
 
 // ---------- Health ----------
-
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// ---------- Jane debug helpers ----------
-
-app.get("/jane/debug", async (_req, res) => {
-  const base = canonicalJaneBase(
-    process.env.JANE_API_BASE || "https://pos.iheartjane.com"
-  );
-  const merchantId = process.env.JANE_MERCHANT_ID || "56";
-  const storeId = process.env.JANE_STORE_ID || "100";
-  const tokenPresent = !!process.env.JANE_API_TOKEN;
-  const tokenLength = process.env.JANE_API_TOKEN
-    ? process.env.JANE_API_TOKEN.length
-    : 0;
+// Jane env debug (no secrets)
+app.get("/jane/debug", (_req, res) => {
+  const base = canonicalJaneBase(process.env.JANE_API_BASE || "https://api.iheartjane.com");
+  const storeId = process.env.JANE_STORE_ID ? String(process.env.JANE_STORE_ID) : null;
+  const tokenSet = !!process.env.JANE_API_TOKEN;
+  const tokenLen = process.env.JANE_API_TOKEN ? process.env.JANE_API_TOKEN.length : 0;
   res.json({
     base,
-    merchantId,
-    storeId,
-    tokenPresent,
-    tokenLength,
-    lookupsEnabled: LOOKUPS_ON,
+    storeIdPresent: !!storeId,
+    tokenPresent: tokenSet,
+    tokenLength: tokenLen,
+    lookupsEnabled: String(process.env.JANE_LOOKUPS_ENABLED || "true"),
   });
 });
 
-// Quick Jane test for inventories (first 20 normalized items)
+// Public IP helper (for Jane allowlisting)
+app.get("/whoami", async (_req, res) => {
+  try {
+    const r = await fetch("https://ifconfig.me/ip");
+    const ip = await r.text();
+    res.json({ ip: ip.trim() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Jane test endpoint
 app.get("/jane/test", async (_req, res) => {
   try {
-    const items = await janeInventorySearch(50);
-    res.json({ ok: true, count: items.length });
+    const items = await janeMenuSearch("maven pre-roll", 3);
+    res.json({ ok: true, sample: items });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 // ---------- Voice Webhook ----------
-
 app.post("/twilio/voice", (req, res) => {
-  const wsUrl = "wss://" + req.get("host") + "/relay";
+  const wsUrl = `wss://${req.get("host")}/relay`;
   const greeting =
     "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?";
 
   const twiml =
-    "<Response>" +
-    "<Connect>" +
-    '<ConversationRelay url="' +
-    escapeXml(wsUrl) +
-    '" ttsProvider="Google" voice="en-US-Wavenet-F" welcomeGreeting="' +
-    escapeXml(greeting) +
-    '" />' +
-    "</Connect>" +
-    "</Response>";
+    `<Response>
+       <Connect>
+         <ConversationRelay
+           url="${wsUrl}"
+           ttsProvider="Google"
+           voice="en-US-Wavenet-F"
+           welcomeGreeting="${escapeXml(greeting)}" />
+       </Connect>
+     </Response>`;
 
   console.log("Serving /twilio/voice TwiML:\n", twiml);
   res.type("text/xml").send(twiml);
 });
 
 // ---------- Transfer endpoint (TwiML) ----------
-
 app.post("/twilio/transfer", (_req, res) => {
   const vr = new twilio.twiml.VoiceResponse();
   vr.say("No problem. Transferring you now.");
@@ -315,14 +303,12 @@ app.post("/twilio/transfer", (_req, res) => {
 });
 
 // ---------- Call status logs ----------
-
 app.post("/twilio/status", (req, res) => {
   console.log("Call status:", req.body?.CallStatus, req.body?.CallSid);
   res.sendStatus(200);
 });
 
 // ---------- Start HTTP ----------
-
 const server = app.listen(PORT, () => {
   console.log("Server listening on port", PORT);
 });
@@ -332,7 +318,6 @@ server.on("upgrade", (req) => {
 });
 
 // ---------- WebSocket Bridge ----------
-
 const wss = new WebSocketServer({ server, path: "/relay" });
 
 wss.on("error", (err) => {
@@ -340,9 +325,7 @@ wss.on("error", (err) => {
 });
 
 wss.on("connection", async (twilioWS) => {
-  console.log(
-    "Twilio connected to Conversation Relay (HTTPS Chat + local intents + brand inventory)"
-  );
+  console.log("Twilio connected to Conversation Relay (HTTPS Chat + local intents)");
 
   let currentCallSid = null;
 
@@ -354,66 +337,81 @@ wss.on("connection", async (twilioWS) => {
       return;
     }
 
-    // Capture CallSid on setup
     if (msg.type === "setup") {
       currentCallSid =
-        msg.callSid ||
-        msg.start?.callSid ||
-        msg.start?.twilio?.callSid ||
-        null;
+        msg.callSid || msg.start?.callSid || msg.start?.twilio?.callSid || null;
       console.log("Setup received. CallSid:", currentCallSid);
       return;
     }
 
     if (msg.type === "prompt" && msg.voicePrompt) {
-      const userText = msg.voicePrompt.trim();
-      const q = userText.toLowerCase();
+      const userText = msg.voicePrompt.trim().toLowerCase();
       console.log("Caller said:", userText);
 
-      // -------------------------
-      // 0) Product / brand lookup via Jane POS v3 inventories
-      // -------------------------
-      const productIntent = detectProductQuery(q);
+      // ---------- 0) Product lookup via Jane (before local intents) ----------
+      const productIntent = detectProductQuery(userText);
 
-      if (productIntent) {
-        console.log("Detected brand/product intent:", productIntent);
-        if (!LOOKUPS_ON) {
-          const soft = brandSoftYes(productIntent);
-          safeSend(twilioWS, {
-            type: "text",
-            token: brandVoice(soft),
-            last: true,
-          });
-          return;
-        }
-
+      if (productIntent && JANE_LOOKUPS_ENABLED) {
         const ac = new AbortController();
-        const to = setTimeout(() => ac.abort(), 6000);
-
+        const to = setTimeout(() => ac.abort(), 5000);
         try {
-          const items = await janeInventorySearch(400, ac.signal);
+          const results = await janeMenuSearch(productIntent, 12, ac.signal);
           clearTimeout(to);
-          const summary = summarizeBrandInventory(productIntent, items);
+
+          const list = formatJaneItems(results, 3);
+          const sum = summarizeJaneResults(results);
+
+          let headline;
+          if (sum.count > 0) {
+            const minS = money(sum.min);
+            const maxS = money(sum.max);
+            if (minS && maxS && minS !== maxS) {
+              headline = `I’m seeing about ${sum.count} items right now. Current price range is ${minS} to ${maxS}.`;
+            } else if (minS && (!maxS || minS === maxS)) {
+              headline = `I’m seeing about ${sum.count} items right now. Current price is around ${minS}.`;
+            } else {
+              headline = `I’m seeing about ${sum.count} items right now. Pricing varies by strain.`;
+            }
+          } else {
+            headline = `I didn’t see that available right now.`;
+          }
+
+          const msgOut =
+            sum.count > 0
+              ? list
+                ? `Yes — we carry ${productIntent}. ${headline} Top picks: ${list}. You can order at Crystal Nugs dot com.`
+                : `Yes — we carry ${productIntent}. ${headline} You can check varieties and prices at Crystal Nugs dot com.`
+              : `I didn’t see ${productIntent} available right now. Please check Crystal Nugs dot com for live inventory.`;
+
           safeSend(twilioWS, {
             type: "text",
-            token: brandVoice(summary),
+            token: brandVoice(msgOut),
             last: true,
           });
         } catch (e) {
           clearTimeout(to);
-          console.error("Jane inventory error:", e.message);
-          const soft = brandSoftYes(productIntent);
+          console.error("Jane lookup error:", e.message);
+          // Nice fallback: still answer yes generically if brand matched
+          const softYes = /maven/i.test(productIntent)
+            ? "Yes — we carry Maven. You can check current varieties and prices at Crystal Nugs dot com."
+            : "I couldn’t reach our live menu just now. Please check Crystal Nugs dot com for current stock.";
           safeSend(twilioWS, {
             type: "text",
-            token: brandVoice(soft),
+            token: brandVoice(softYes),
             last: true,
           });
         }
         return;
+      } else if (productIntent && !JANE_LOOKUPS_ENABLED) {
+        const soft = /maven/i.test(productIntent)
+          ? "Yes — we carry Maven. Check Crystal Nugs dot com for varieties and prices."
+          : "We carry that brand. Check Crystal Nugs dot com for live inventory.";
+        safeSend(twilioWS, { type: "text", token: brandVoice(soft), last: true });
+        return;
       }
 
-      // 1) Local intents (fast path)
-      const local = handleLocalIntent(q);
+      // ---------- 1) Local intents (fast path) ----------
+      const local = handleLocalIntent(userText);
 
       // Immediate transfer branch
       if (local === "__TRANSFER_NOW__") {
@@ -430,9 +428,9 @@ wss.on("connection", async (twilioWS) => {
           safeSend(twilioWS, {
             type: "text",
             token: brandVoice(
-              "I couldn’t transfer the call just now. Here’s our direct line: " +
-                speakPhone(TRANSFER_NUMBER) +
-                "."
+              `I couldn’t transfer the call just now. Here’s our direct line: ${speakPhone(
+                TRANSFER_NUMBER
+              )}.`
             ),
             last: true,
           });
@@ -449,7 +447,7 @@ wss.on("connection", async (twilioWS) => {
         return;
       }
 
-      // 2) OpenAI fallback
+      // ---------- 2) OpenAI fallback ----------
       if (!OPENAI_API_KEY) {
         safeSend(twilioWS, {
           type: "text",
@@ -460,7 +458,7 @@ wss.on("connection", async (twilioWS) => {
       }
 
       try {
-        const answer = await askOpenAI(q);
+        const answer = await askOpenAI(userText);
         safeSend(twilioWS, {
           type: "text",
           token: brandVoice(answer),
@@ -479,21 +477,19 @@ wss.on("connection", async (twilioWS) => {
     }
   });
 
-  twilioWS.on("error", (err) => {
-    console.error("Twilio WS error:", err?.message || err);
-  });
-
-  twilioWS.on("close", (code, reason) => {
-    console.log("Twilio WS closed:", code, reason?.toString());
-  });
+  twilioWS.on("error", (err) =>
+    console.error("Twilio WS error:", err?.message || err)
+  );
+  twilioWS.on("close", (code, reason) =>
+    console.log("Twilio WS closed:", code, reason?.toString())
+  );
 });
 
 // ---------- Local Intent Handler ----------
-
 function handleLocalIntent(q = "") {
   const maybeZip = extractZip(q);
 
-  // Ask-for-human (explicit)
+  // Ask-for-human
   const wantsHuman = /\b(representative|agent|human|person|operator|manager|associate|someone|live\s*agent)\b/.test(
     q
   );
@@ -502,10 +498,10 @@ function handleLocalIntent(q = "") {
   // Delivery question types
   const asksMin = /\b(min|minimum|order minimum|what.*minimum)\b/.test(q);
   const asksFee = /\b(fee|delivery fee|charge|cost)\b/.test(q);
-  const asksDelivery =
-    /\b(deliver|delivery|zone|area|order|eta|time|how long|arrive)\b/.test(q);
+  const asksDelivery = /\b(deliver|delivery|zone|area|order|eta|time|how long|arrive)\b/.test(
+    q
+  );
 
-  // Explicit "deliver to" phrasing
   const asksDeliverTo =
     /\b(can|do|will|y['’]?all|you)\s*(?:.*\s)?(deliver|drop\s?off|bring|meet)\s*(?:to|at)\b/.test(
       q
@@ -513,15 +509,14 @@ function handleLocalIntent(q = "") {
     /\bdeliver\s*(?:to|at)\b/.test(q) ||
     /\bdo you deliver\b/.test(q);
 
-  // Venue detection
   const mentionsHotel = /\b(hotel|motel|inn|suite|resort|lodg(e|ing)|air\s?bnb|airbnb)\b/.test(
     q
   );
-  const mentionsVenue = /\b(restaurant|bar|club|truck\s?stop|truckstop|gas\s?station|diner|cafe|pub)\b/.test(
+  const mentionsVenue = /\b(restaurant|bar|club|truck\s?stop|truckstop|gas\s?station|parking\s?lot|diner|cafe|pub)\b/.test(
     q
   );
 
-  // ONLY when they explicitly ask "deliver to" one of these venues
+  // Venue-specific answer when explicitly asked if we deliver *to* them
   if (asksDeliverTo && (mentionsHotel || mentionsVenue)) {
     const z = maybeZip ? speakZip(maybeZip) : null;
     const placeLabel = venueLabel({ mentionsHotel, mentionsVenue });
@@ -532,37 +527,15 @@ function handleLocalIntent(q = "") {
         const min = formatMoney(rec.minimum);
         const fee = formatMoney(rec.fee);
         const win = rec.window || computeEtaWindow(rec.minimum, maybeZip);
-        return (
-          "Yes — we deliver to " +
-          placeLabel +
-          " in ZIP " +
-          z +
-          ". ETA " +
-          win +
-          ". Minimum " +
-          min +
-          ". Fee " +
-          fee +
-          ". " +
-          LAST_CALL
-        );
+        return `Yes — we deliver to ${placeLabel} in ZIP ${z}. ETA ${win}. Minimum ${min}. Fee ${fee}. ${LAST_CALL}`;
       }
-      return (
-        "Yes — we deliver to " +
-        placeLabel +
-        " in that area. For ZIP " +
-        z +
-        ", I don’t have a record on file. Share a nearby ZIP and I’ll confirm ETA, minimum, and fee."
-      );
+      return `Yes — we deliver to ${placeLabel} in that area. For ZIP ${z}, I don’t have a record on file. Share a nearby ZIP and I’ll confirm ETA, minimum, and fee.`;
     }
 
-    return (
-      DELIVERY_PLACES +
-      " What’s your 5-digit ZIP so I can confirm ETA, minimum, and fee? For example: 9-5-8-1-6."
-    );
+    return `${DELIVERY_PLACES} What’s your 5-digit ZIP so I can confirm ETA, minimum, and fee? For example: 9-5-8-1-6.`;
   }
 
-  // ZIP-specific minimum/fee/ETA when they ask about delivery details
+  // ZIP-specific minimum/fee/ETA
   if ((asksMin || asksFee || asksDelivery) && maybeZip) {
     const rec = deliveryByZip(maybeZip);
     const z = speakZip(maybeZip);
@@ -570,39 +543,24 @@ function handleLocalIntent(q = "") {
       const min = formatMoney(rec.minimum);
       const fee = formatMoney(rec.fee);
       const win = rec.window || computeEtaWindow(rec.minimum, maybeZip);
-      return (
-        "For ZIP " +
-        z +
-        ": estimated delivery " +
-        win +
-        ". Delivery minimum " +
-        min +
-        ". Delivery fee " +
-        fee +
-        ". " +
-        LAST_CALL
-      );
+      return `For ZIP ${z}: estimated delivery ${win}. Delivery minimum ${min}. Delivery fee ${fee}. ${LAST_CALL}`;
     }
-    return (
-      "For ZIP " +
-      z +
-      ": I don’t have a set delivery policy. Share a nearby ZIP and I’ll confirm your window, minimum, and fee."
-    );
+    return `For ZIP ${z}: I don’t have a set delivery policy. Share a nearby ZIP and I’ll confirm your window, minimum, and fee.`;
   }
 
-  // Ask for ZIP if they want minimum/fee/ETA but didn’t give one
+  // Ask for ZIP first if they want delivery details but didn’t give one
   if (asksMin || asksFee || asksDelivery) {
-    return "What’s your 5-digit ZIP so I can confirm your delivery window, minimum, and fee? For example: 9-5-8-1-6.";
+    return `What’s your 5-digit ZIP so I can confirm your delivery window, minimum, and fee? For example: 9-5-8-1-6.`;
   }
 
-  // Existing generic intents
-  if (/\bhour|open|close|when\b/.test(q)) return HOURS + " " + LAST_CALL;
+  // Generic intents
+  if (/\bhour|open|close|when\b/.test(q)) return `${HOURS} ${LAST_CALL}`;
   if (/\baddress|location|where|directions|how to get\b/.test(q)) return MAP_URL;
   if (/\bwebsite|site|url|online|menu\b/.test(q))
     return "You can visit us online at Crystal Nugs dot com.";
-  if (/\bid|identification|age|21\b/.test(q)) return ID_RULES + " " + MED_PTS;
+  if (/\bid|identification|age|21\b/.test(q)) return `${ID_RULES} ${MED_PTS}`;
   if (/\bdeliver|delivery|zone|area|minimum|fee|charge\b/.test(q))
-    return DELIVERY + " " + DELIV_MIN + " " + DELIV_FEE;
+    return `${DELIVERY} ${DELIV_MIN} ${DELIV_FEE}`;
   if (/\bparking|park\b/.test(q)) return PARKING;
   if (/\bpay|payment|cash|card|debit|atm|jane ?pay\b/.test(q)) return PAYMENT;
   if (/\bdeal|special|discount|offer|promotion|promo\b/.test(q)) return SPECIALS;
@@ -613,32 +571,25 @@ function handleLocalIntent(q = "") {
 }
 
 // ---------- OpenAI Chat fallback ----------
-
 async function askOpenAI(userText) {
-  const systemPrompt =
-    "You are the Crystal Nugs Sacramento AI voice assistant. " +
-    "Speak in a warm, concierge tone. Keep sentences short. Use natural pauses. " +
-    'Never read raw URLs. Say "Crystal Nugs dot com" instead of a link. ' +
-    "If asked for a person, say “No problem, transferring you now.” " +
-    "Store hours: " +
-    HOURS +
-    " Address: " +
-    ADDRESS +
-    " Website: " +
-    toSpokenText(WEBSITE) +
-    " Delivery: " +
-    DELIVERY +
-    " ID rules: " +
-    ID_RULES +
-    " Payment: " +
-    PAYMENT +
-    " Returns: " +
-    RETURNS;
+  const systemPrompt = `
+You are the Crystal Nugs Sacramento AI voice assistant.
+Speak in a warm, concierge tone. Keep sentences short. Use natural pauses.
+Never read raw URLs. Say "Crystal Nugs dot com" instead of a link.
+If asked for a person, say “No problem, transferring you now.”
+Store hours: ${HOURS}
+Address: ${ADDRESS}
+Website: ${toSpokenText(WEBSITE)}
+Delivery: ${DELIVERY}
+ID rules: ${ID_RULES}
+Payment: ${PAYMENT}
+Returns: ${RETURNS}
+  `;
 
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      Authorization: "Bearer " + OPENAI_API_KEY,
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
@@ -654,12 +605,7 @@ async function askOpenAI(userText) {
   if (!resp.ok) {
     const errText = await resp.text().catch(() => "");
     throw new Error(
-      "OpenAI " +
-        resp.status +
-        " " +
-        resp.statusText +
-        ": " +
-        errText.slice(0, 500)
+      `OpenAI ${resp.status} ${resp.statusText}: ${errText.slice(0, 500)}`
     );
   }
 
@@ -668,383 +614,162 @@ async function askOpenAI(userText) {
   return answer || "Sorry, I didn’t catch that.";
 }
 
-// ---------- Jane POS helpers (Inventories) ----------
+// ---------- Jane helpers ----------
 
+// Canonicalize base to api.iheartjane.com
 function canonicalJaneBase(input) {
-  const def = "https://pos.iheartjane.com";
+  const def = "https://api.iheartjane.com";
   let u = String(input || "").trim().toLowerCase();
   if (!u) return def;
-  if (u.includes("iheartjane.com") && !u.includes("pos.iheartjane.com"))
-    return def;
-  if (!/^https?:\/\//.test(u)) u = "https://" + u;
+  if (u.includes("iheartjane.com") && !u.includes("api.iheartjane.com")) return def;
+  if (!/^https?:\/\//.test(u)) u = `https://${u}`;
   return u.replace(/\/+$/, "");
 }
 
-// Normalize money: cents -> "$xx" or "$xx.yy"
-function moneyFromCents(cents) {
-  const n = Number(cents);
-  if (Number.isNaN(n)) return null;
-  const s = (n / 100).toFixed(2);
-  return "$" + (s.endsWith(".00") ? parseInt(s, 10) : s);
-}
-
-// Fetch inventories for merchant/store, normalize into a flat array
-async function janeInventorySearch(limit = 400, signal) {
+async function janeMenuSearch(q, limit = 6, signal) {
   const base = canonicalJaneBase(
-    process.env.JANE_API_BASE || "https://pos.iheartjane.com"
+    process.env.JANE_API_BASE || "https://api.iheartjane.com"
   );
-  const merchantId = process.env.JANE_MERCHANT_ID || "56";
-  const storeId = process.env.JANE_STORE_ID || "100";
+  const storeId = process.env.JANE_STORE_ID;
   const token = process.env.JANE_API_TOKEN;
-  if (!token || !merchantId || !storeId) {
-    throw new Error(
-      "Missing Jane POS env vars (JANE_API_TOKEN, JANE_MERCHANT_ID, JANE_STORE_ID)"
-    );
+  if (!token || !storeId) throw new Error("Missing Jane API env vars");
+
+  const url = new URL(`/v1/stores/${storeId}/menu/items`, base);
+  if (q) url.searchParams.set("q", q);
+  url.searchParams.set("limit", String(limit));
+  url.searchParams.set("availability", "available");
+
+  const resp = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "User-Agent": "CrystalNugs-VoiceBot/1.0",
+    },
+    signal,
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    if (resp.status === 403 || /cloudflare/i.test(text)) {
+      throw new Error(
+        "Jane API blocked (403). Check JANE_API_BASE and token; may need IP allowlist."
+      );
+    }
+    throw new Error(`Jane ${resp.status}: ${text.slice(0, 300)}`);
   }
 
-  const pageSize = Math.min(Math.max(limit, 1), 400) > 100 ? 100 : limit;
-  let url = new URL(
-    "/api/v3/merchants/" + merchantId + "/stores/" + storeId + "/inventories",
-    base
-  );
-  url.searchParams.set("page[size]", String(pageSize));
-
-  const all = [];
-  let page = 1;
-
-  while (url && all.length < limit) {
-    console.log("Jane inventories fetch page " + page + ", url=" + url);
-    const resp = await fetch(url.toString(), {
-      headers: {
-        Authorization: "Bearer " + token,
-        Accept: "application/json",
-        "User-Agent": "CrystalNugs-VoiceBot/1.0",
-      },
-      signal,
-    });
-
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => "");
-      if (resp.status === 401) {
-        throw new Error("Jane 401: Invalid API token for POS v3.");
-      }
-      if (resp.status === 403 || /cloudflare/i.test(text)) {
-        throw new Error(
-          "Jane API blocked (403). Ask your Jane rep to allowlist your server IP and confirm POS API scopes."
-        );
-      }
-      throw new Error("Jane " + resp.status + ": " + text.slice(0, 300));
-    }
-
-    const data = (await resp.json().catch(() => null)) || {};
-    const arr = Array.isArray(data.data) ? data.data : [];
-
-    for (const row of arr) {
-      const attrs = row?.attributes || {};
-      const product = attrs.product || {};
-      const brand =
-        attrs.brand ||
-        product.brand ||
-        product.brand_name ||
-        attrs.brand_name ||
-        "";
-      const category =
-        attrs.category || product.category || product.product_category || "";
-      const name =
-        attrs.name ||
-        product.name ||
-        product.product_name ||
-        attrs.description ||
-        "";
-      const priceCents =
-        attrs.price_cents ??
-        attrs.price ??
-        product.price_cents ??
-        product.price ??
-        null;
-
-      all.push({
-        brand: String(brand || "").trim(),
-        category: String(category || "").trim(),
-        name: String(name || "").trim(),
-        price_cents: priceCents,
-        raw: row,
-      });
-
-      if (all.length >= limit) break;
-    }
-
-    const nextUrl = data?.links?.next;
-    if (!nextUrl || all.length >= limit) break;
-    url = new URL(nextUrl);
-    page += 1;
-  }
-
-  console.log("Jane total inventories normalized:", all.length);
-  return all;
+  const data = await resp.json();
+  return Array.isArray(data) ? data : data?.items || [];
 }
 
-// --------- Brand / category intent + summary ----------
-
-const ALWAYS_CARRY_BRANDS = [
-  "Maven",
-  "STIIIZY",
-  "Raw Garden",
-  "Uncle Larry",
-  "Gummie Grannie",
-  "Bahati",
-  "Crystal Nugs",
-  "Seven Leaves",
-];
-
-function detectProductQuery(text = "") {
-  const t = text.toLowerCase();
-  const askedCarry = /\b(carry|have|stock|sell|do you (have|carry))\b/.test(t);
-  const wantsPreroll =
-    /(pre[\s-]?rolls?|joints?|infused pre[\s-]?rolls?|mini blunts?)/i.test(t);
-  const wantsVape =
-    /\b(vapes?|cart|cartridge|pod|pods?|disposable|all[-\s]?in[-\s]?one)\b/.test(
-      t
-    );
-  const wantsFlower =
-    /\b(flower|eighth|3\.5g|7g|quarter|half[-\s]?ounce|ounce|oz)\b/.test(t);
-  const wantsEdible =
-    /\b(edible|gumm(?:y|ies)|chocolate|cookie|brownie|drink|beverage)\b/.test(
-      t
-    );
-
-  // normalize common misspellings
-  const normalized = t.replace(/\bsteezy\b/g, "stiiizy").replace(
-    /\bstizzy\b/g,
-    "stiiizy"
-  );
-
-  let brand = null;
-  let rawBrandToken = null;
-
-  if (/\bmaven(\s+genetics)?\b/i.test(normalized)) {
-    brand = "Maven";
-    rawBrandToken = "maven";
-  } else if (/\bstii?izy\b/i.test(normalized)) {
-    brand = "STIIIZY";
-    rawBrandToken = "stiiizy";
-  } else if (/\braw\s+garden\b/i.test(normalized)) {
-    brand = "Raw Garden";
-    rawBrandToken = "raw garden";
-  } else if (/\buncle\s+larry\b/i.test(normalized)) {
-    brand = "Uncle Larry";
-    rawBrandToken = "uncle larry";
-  }
-
-  let category = null;
-  if (wantsVape) category = "vape";
-  else if (wantsPreroll) category = "pre-roll";
-  else if (wantsFlower) category = "flower";
-  else if (wantsEdible) category = "edible";
-
-  if (!brand && !askedCarry && !wantsPreroll && !wantsVape && !wantsFlower && !wantsEdible) {
-    return null;
-  }
-
-  // Keyword only (like "gelato pre rolls")
-  if (!brand && category) {
-    const kwMatch = normalized.match(
-      /\b(gelato|zkittlez|blueberry|infused|cookie|cookies|lemon|sour diesel)\b/i
-    );
-    const keyword = kwMatch ? kwMatch[0] : null;
-    return {
-      brand: null,
-      category,
-      keyword,
-      rawBrandToken: null,
-      rawText: text,
-    };
-  }
-
-  if (!brand && askedCarry) {
-    const genericMatch = normalized.match(/\b([a-z0-9']{3,})\b/gi);
-    const keyword = genericMatch ? genericMatch[genericMatch.length - 1] : null;
-    return {
-      brand: null,
-      category,
-      keyword,
-      rawBrandToken: keyword,
-      rawText: text,
-    };
-  }
-
-  return {
-    brand,
-    category,
-    keyword: null,
-    rawBrandToken,
-    rawText: text,
-  };
+// Ignore $0 and quantity 0
+function centsToMoney(cents) {
+  const n = Number(cents);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const s = (n / 100).toFixed(2);
+  return s.endsWith(".00") ? `$${parseInt(s, 10)}` : `$${s}`;
 }
 
-function normalizeCategoryLabel(text = "") {
-  const s = text.toLowerCase();
-  if (/vape|pod|cartridge|disposable|all[-\s]?in[-\s]?one/.test(s))
-    return "vape";
-  if (/pre.?roll|joint|mini blunts?/.test(s)) return "pre-roll";
-  if (/flower|bud|nugs?/.test(s)) return "flower";
-  if (/edible|gumm|chocolate|cookie|brownie|drink|beverage/.test(s))
-    return "edible";
+// Only keep items that have >0 price and >0 quantity (item or variant)
+function validJaneItems(items = []) {
+  return items.filter((it) => {
+    const price = it?.price?.price || 0;
+    const qty = it?.quantity_available ?? it?.quantity ?? 0;
+    if (price > 0 && qty > 0) return true;
+
+    const vars = Array.isArray(it?.variants) ? it.variants : [];
+    return vars.some(
+      (v) =>
+        Number(v?.price?.price) > 0 &&
+        Number(v?.quantity_available ?? v?.quantity ?? 0) > 0
+    );
+  });
+}
+
+function deriveItemPrice(item) {
+  const directQty = item?.quantity_available ?? item?.quantity ?? 0;
+  const direct = centsToMoney(item?.price?.price);
+  if (direct && directQty > 0) return direct;
+
+  const vars = Array.isArray(item?.variants) ? item.variants : [];
+  for (const v of vars) {
+    const qty = v?.quantity_available ?? v?.quantity ?? 0;
+    if (qty > 0) {
+      const p = centsToMoney(v?.price?.price);
+      if (p) return p;
+    }
+  }
   return null;
 }
 
-function summarizeBrandInventory(intent, items = []) {
-  const brand = intent.brand;
-  const brandLabel = brand || "that brand";
-  const brandLower = brand ? brand.toLowerCase() : null;
-  const keywordLower = intent.keyword ? intent.keyword.toLowerCase() : null;
-  const desiredCategory = intent.category || null;
-
-  function matchesBrand(it) {
-    if (!brandLower) return true;
-    const inBrand = (it.brand || "").toLowerCase().includes(brandLower);
-    const inName = (it.name || "").toLowerCase().includes(brandLower);
-    return inBrand || inName;
+function formatJaneItems(items = [], max = 3) {
+  const valid = validJaneItems(items);
+  const priced = [];
+  for (const it of valid) {
+    const price = deriveItemPrice(it);
+    if (!price) continue;
+    const brand = it?.brand?.name ? `${it.brand.name} ` : "";
+    const name = it?.name || "product";
+    priced.push(`${brand}${name} at ${price}`);
+    if (priced.length >= max) break;
   }
+  return priced.length ? priced.join(", ") : null;
+}
 
-  function matchesKeyword(it) {
-    if (!keywordLower) return true;
-    return (it.name || "").toLowerCase().includes(keywordLower);
-  }
+function summarizeJaneResults(items = []) {
+  const valid = validJaneItems(items);
+  const nums = [];
+  for (const it of valid) {
+    const p = Number((it?.price?.price || 0) / 100);
+    if (p > 0) nums.push(p);
 
-  function inferredCategory(it) {
-    return normalizeCategoryLabel(it.category || it.name);
-  }
-
-  const brandOnly = items.filter((it) => matchesBrand(it));
-  const filtered = brandOnly.filter((it) => {
-    if (!matchesKeyword(it)) return false;
-    if (!desiredCategory) return true;
-    const cat = inferredCategory(it);
-    return cat === desiredCategory;
-  });
-
-  const set = filtered.length ? filtered : brandOnly;
-  const count = set.length;
-
-  if (count === 0) {
-    if (brand && ALWAYS_CARRY_BRANDS.includes(brand)) {
-      const catLabel = desiredCategory ? humanCategory(desiredCategory) : "items";
-      return (
-        "Yes — we carry " +
-        brandLabel +
-        " " +
-        catLabel +
-        ". I can’t see the live counts from Jane’s system right now, " +
-        "so for exact strains and prices please check Crystal Nugs dot com or ask your budtender."
-      );
+    const vars = Array.isArray(it?.variants) ? it.variants : [];
+    for (const v of vars) {
+      const qty = v?.quantity_available ?? v?.quantity ?? 0;
+      const vp = Number((v?.price?.price || 0) / 100);
+      if (vp > 0 && qty > 0) nums.push(vp);
     }
-    return (
-      "I’m not seeing " +
-      brandLabel +
-      " in the live menu snapshot right now. It could be sold out or listed under another name. " +
-      "Please double-check on Crystal Nugs dot com or ask your budtender."
-    );
   }
-
-  // compute price range
-  let minCents = null;
-  let maxCents = null;
-  for (const it of set) {
-    const c = Number(it.price_cents);
-    if (!Number.isFinite(c)) continue;
-    if (minCents === null || c < minCents) minCents = c;
-    if (maxCents === null || c > maxCents) maxCents = c;
-  }
-
-  const approx = count;
-  let countPhrase;
-  if (approx <= 5) countPhrase = "about " + approx;
-  else if (approx <= 15) countPhrase = "around " + approx;
-  else if (approx <= 30) countPhrase = "over 10";
-  else countPhrase = "over 20";
-
-  const catLabel = desiredCategory
-    ? humanCategory(desiredCategory)
-    : "items";
-
-  let pricePart = "";
-  const minPrice = moneyFromCents(minCents);
-  const maxPrice = moneyFromCents(maxCents);
-  if (minPrice && maxPrice && minCents !== maxCents) {
-    pricePart =
-      " Prices usually start around " +
-      minPrice +
-      " and go up to about " +
-      maxPrice +
-      " before tax.";
-  } else if (minPrice) {
-    pricePart =
-      " Prices usually start around " + minPrice + " before tax.";
-  }
-
-  let opening;
-  if (brand) {
-    opening =
-      "Yes — we carry " +
-      brandLabel +
-      " " +
-      catLabel +
-      ". I’m seeing " +
-      countPhrase +
-      " on the live menu right now.";
-  } else {
-    opening =
-      "I’m seeing " +
-      countPhrase +
-      " " +
-      catLabel +
-      " that match your request on the live menu.";
-  }
-
-  return (
-    opening +
-    pricePart +
-    " For exact strain names and availability, visit Crystal Nugs dot com and search for " +
-    (brand || intent.keyword || "that item") +
-    "."
-  );
+  nums.sort((a, b) => a - b);
+  if (!nums.length) return { count: valid.length, min: null, max: null };
+  return { count: valid.length, min: nums[0], max: nums[nums.length - 1] };
 }
 
-function humanCategory(cat) {
-  if (cat === "vape") return "vapes";
-  if (cat === "pre-roll") return "pre-rolls";
-  if (cat === "flower") return "flower";
-  if (cat === "edible") return "edibles";
-  return "items";
+function money(num) {
+  if (!Number.isFinite(num) || num <= 0) return null;
+  const s = num.toFixed(2);
+  return s.endsWith(".00") ? `$${parseInt(s, 10)}` : `$${s}`;
 }
 
-// ALWAYS-positive soft answer if inventory lookup fails completely
-function brandSoftYes(intent) {
-  const brand = intent.brand || intent.keyword || "that brand";
-  const cat = intent.category || null;
-  const catLabel = cat ? humanCategory(cat) : "items";
+// Smarter brand detector with misspellings
+function detectProductQuery(text = "") {
+  const t = text.toLowerCase();
+  const askedCarry = /\b(carry|have|stock|sell|do you (have|carry))\b/.test(t);
+  const wantsPreroll = /(pre[\s-]?rolls?|joints?|infused pre[\s-]?rolls?)/i.test(t);
 
-  if (ALWAYS_CARRY_BRANDS.includes(intent.brand || "")) {
-    return (
-      "Yes — we carry " +
-      brand +
-      " " +
-      catLabel +
-      ". For live strains and prices, please check Crystal Nugs dot com or ask your budtender."
-    );
+  const normalized = t
+    .replace(/\bsteezy\b/g, "stiiizy")
+    .replace(/\bstizzy\b/g, "stiiizy");
+
+  const brands = [];
+  if (/\bmaven(\s+genetics)?\b/i.test(normalized)) brands.push("Maven");
+  if (/\bstii?izy\b/i.test(normalized)) brands.push("STIIIZY");
+  if (/\braw\s+garden\b/i.test(normalized)) brands.push("Raw Garden");
+
+  if (brands.length && (askedCarry || wantsPreroll)) {
+    if (/\bflower|eighth|7g|3\.5g\b/.test(normalized)) return `${brands[0]} flower`;
+    if (/\bvape|pod|cart|cartridge\b/.test(normalized)) return `${brands[0]} vape`;
+    return `${brands[0]} pre-rolls`;
   }
-  return (
-    "We often carry " +
-    brand +
-    " " +
-    catLabel +
-    ", but availability can change quickly. Please check Crystal Nugs dot com or ask your budtender for live menu details."
-  );
+
+  if ((askedCarry || wantsPreroll) && /\b(gelato|zkittlez|blueberry|infused)\b/i.test(normalized)) {
+    const term = normalized.match(/\b(gelato|zkittlez|blueberry|infused)\b/i)?.[0];
+    return `${term} pre-rolls`;
+  }
+  return null;
 }
 
 // ---------- Utils ----------
-
 function safeSend(ws, obj) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   try {
@@ -1062,32 +787,27 @@ function escapeXml(str = "") {
     .replace(/>/g, "&gt;");
 }
 
-/** Speak ZIP as hyphenated digits: "95827" -> "9-5-8-2-7" */
 function speakZip(zip = "") {
   const z = String(zip).replace(/[^\d]/g, "").slice(0, 5);
   return z.split("").join("-");
 }
 
-/** Extract first 5-digit ZIP from text */
 function extractZip(text = "") {
   const m = String(text).match(/\b\d{5}\b/);
   return m ? m[0] : null;
 }
 
-/** Lookup delivery record by ZIP */
 function deliveryByZip(zip) {
   return DELIVERY_TABLE.find((r) => r.zip === zip) || null;
 }
 
-/** Format money; 40 -> $40, 1.99 -> $1.99 */
 function formatMoney(n) {
   const num = Number(n);
   if (Number.isNaN(num)) return String(n);
   const s = num.toFixed(2);
-  return s.endsWith(".00") ? "$" + parseInt(s, 10) : "$" + s;
+  return s.endsWith(".00") ? `$${parseInt(s, 10)}` : `$${s}`;
 }
 
-/** Compute ETA window if not set, based on minimum (heuristic) */
 function computeEtaWindow(minimum) {
   const m = Number(minimum) || 0;
   if (m <= 40) return "30–60 minutes";
@@ -1098,27 +818,20 @@ function computeEtaWindow(minimum) {
   return "120–240 minutes";
 }
 
-/** Convert crystalnugs.com + emails to friendly spoken phrases */
 function toSpokenText(text = "") {
   if (!text) return "";
   let out = String(text);
-  out = out.replace(
-    /https?:\/\/(www\.)?crystalnugs\.com\/?/gi,
-    "Crystal Nugs dot com"
-  );
+  out = out.replace(/https?:\/\/(www\.)?crystalnugs\.com\/?/gi, "Crystal Nugs dot com");
   out = out.replace(/\bwww\.crystalnugs\.com\b/gi, "Crystal Nugs dot com");
   out = out.replace(/\bcrystalnugs\.com\b/gi, "Crystal Nugs dot com");
   out = out.replace(
     /\b([a-z0-9._%+-]+)@crystalnugs\.com\b/gi,
-    function (_m, user) {
-      return user + " at crystal nugs dot com";
-    }
+    (_m, user) => `${user} at crystal nugs dot com`
   );
   out = out.replace(/https?:\/\//gi, "");
   return out;
 }
 
-/** Venue label helper for natural phrasing */
 function venueLabel({ mentionsHotel, mentionsVenue }) {
   if (mentionsHotel && mentionsVenue)
     return "hotels, motels, restaurants, bars, and truck stops";
@@ -1126,9 +839,10 @@ function venueLabel({ mentionsHotel, mentionsVenue }) {
   return "restaurants, bars, and truck stops";
 }
 
-/** Brand voice (plain for now; SSML disabled) */
+// Brand voice: plain or SSML
 function brandVoice(raw = "") {
   const cleaned = toSpokenText(raw).trim();
+
   if (!USE_SSML) {
     return cleaned
       .replace(/\s+/g, " ")
@@ -1138,6 +852,35 @@ function brandVoice(raw = "") {
       .replace(/\.\s*\./g, ".")
       .replace(/\s{2,}/g, " ");
   }
-  // SSML version could go here later if desired
-  return cleaned;
+
+  const parts = cleaned
+    .split(/(?<=[\.\?!])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const ssmlBody = parts.map((s) => emphasisLead(s, 3)).join('<break time="240ms"/>');
+
+  return `<speak>
+    <prosody rate="fast" pitch="+8%" volume="medium">
+      ${ssmlBody}
+    </prosody>
+  </speak>`;
+}
+
+function emphasisLead(sentence = "", n = 3) {
+  const tokens = sentence.split(/\s+/).filter(Boolean);
+  const lead = tokens.slice(0, n).join(" ");
+  const tail = tokens.slice(n).join(" ");
+  const leadEsc = escapeSSML(lead);
+  const tailEsc = escapeSSML(tail);
+  return tail
+    ? `<emphasis level="moderate">${leadEsc}</emphasis> ${tailEsc}`
+    : `<emphasis level="moderate">${leadEsc}</emphasis>`;
+}
+
+function escapeSSML(str = "") {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
