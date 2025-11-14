@@ -1163,6 +1163,7 @@ function venueLabel({ mentionsHotel, mentionsVenue }) {
 function brandVoice(raw = "") {
   const cleaned = toSpokenText(raw).trim();
 
+  // Plain text mode (no SSML)
   if (!USE_SSML) {
     return cleaned
       .replace(/\s+/g, " ")
@@ -1173,29 +1174,47 @@ function brandVoice(raw = "") {
       .replace(/\s{2,}/g, " ");
   }
 
+  // SSML mode
   const parts = cleaned
     .split(/(?<=[\.\?!])\s+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+    .map(function (s) { return s.trim(); })
+    .filter(function (s) { return s.length > 0; });
 
-  const ssmlBody = parts.map((s) => emphasisLead(s, 3)).join('<break time="240ms"/>');
+  const ssmlBody = parts
+    .map(function (s) { return emphasisLead(s, 3); })
+    .join('<break time="240ms"/>');
 
-  return `<speak>
-    <prosody rate="fast" pitch="+8%" volume="medium">
-      ${ssmlBody}
-    </prosody>
-  </speak>`;
+  return (
+    '<speak>' +
+      '<prosody rate="fast" pitch="+8%" volume="medium">' +
+        ssmlBody +
+      '</prosody>' +
+    '</speak>'
+  );
 }
 
 function emphasisLead(sentence = "", n = 3) {
-  const tokens = sentence.split(/\s+/).filter(Boolean);
+  const tokens = sentence.split(/\s+/).filter(function (t) { return t; });
   const lead = tokens.slice(0, n).join(" ");
   const tail = tokens.slice(n).join(" ");
+
   const leadEsc = escapeSSML(lead);
   const tailEsc = escapeSSML(tail);
-  return tail
-    ? `<emphasis level="moderate">${leadEsc}</emphasis> ${tailEsc>`
-    : `<emphasis level="moderate">${leadEsc}</emphasis>`;
+
+  if (tailEsc) {
+    return (
+      '<emphasis level="moderate">' +
+        leadEsc +
+      '</emphasis> ' +
+      tailEsc
+    );
+  }
+
+  return (
+    '<emphasis level="moderate">' +
+      leadEsc +
+    '</emphasis>'
+  );
 }
 
 function escapeSSML(str = "") {
