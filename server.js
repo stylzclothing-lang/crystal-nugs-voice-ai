@@ -1,6 +1,4 @@
 // server.js — Crystal Nugs Voice AI + Jane POS v3 Merchant Products + Live Transfer
-// ConversationRelay + Product search (iHeartJane POS v3) + Local Intents (ZIP-aware mins/fees/ETA) + Venue answers + OpenAI fallback
-// Includes: URL/email sanitizer, SSML brand voice (optional), robust logging, in-call transfer
 
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
@@ -21,13 +19,13 @@ const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini";
 const USE_SSML =
   String(process.env.CN_USE_SSML || "false").toLowerCase() === "true";
 
-// Prefer explicit transfer env; fall back to old variable; final fallback is store line.
+// Transfer number
 const TRANSFER_NUMBER =
   process.env.TWILIO_TRANSFER_NUMBER ||
   process.env.TWILIO_VOICE_FALLBACK ||
-  "+19167019777"; // Crystal Nugs store line in E.164
+  "+19167019777";
 
-// Kill-switch for Jane lookups while you sort out POS/allowlisting if needed
+// Kill switch for Jane
 const LOOKUPS_ON =
   String(process.env.JANE_LOOKUPS_ENABLED || "true").toLowerCase() === "true";
 
@@ -68,7 +66,7 @@ function speakPhone(e164 = "+19167019777") {
     .replace(/,\s*$/, "");
 }
 
-// ---------- Live transfer (Calls API) ----------
+// ---------- Live transfer ----------
 async function transferLiveCall(callSid) {
   if (!callSid) throw new Error("Missing CallSid for transfer");
   const ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
@@ -84,7 +82,7 @@ async function transferLiveCall(callSid) {
   return client.calls(callSid).update({ method: "POST", url: TRANSFER_URL });
 }
 
-// ===== Business Facts (env-driven; update in Render → Environment) =====
+// ===== Business Facts =====
 const HOURS =
   process.env.CN_HOURS ||
   "Our dispensary is open daily from 9:00 AM to 9:00 PM, and we take delivery orders from 8:30 AM to 8:30 PM.";
@@ -145,12 +143,11 @@ const MAP_URL =
   process.env.CN_DIRECTIONS_URL ||
   "Crystal Nugs is at 2300 J Street in Midtown Sacramento — the neon green building on the corner of J and 23rd.";
 
-// Venues policy (allowed when asked explicitly)
 const DELIVERY_PLACES =
   process.env.CN_DELIVERY_PLACES ||
   "Yes — we deliver to hotels, motels, restaurants, bars, and truck stops within our service area. Please have a valid government ID (21+) and the name on the order present at handoff. For hotels, include the registered guest and room number; we can meet at the lobby or front desk if required. For restaurants, bars, and truck stops, we’ll meet at the main entrance, host stand, or a safe, well-lit area.";
 
-// ===== Delivery Minimum + Fee + ETA Window table =====
+// ===== Delivery table =====
 const DEFAULT_DELIVERY_TABLE = [
   { zip: "95811", minimum: 40, fee: 1.99, window: "30–60 minutes" },
   { zip: "95814", minimum: 40, fee: 1.99, window: "30–60 minutes" },
@@ -228,7 +225,7 @@ const DEFAULT_DELIVERY_TABLE = [
   { zip: "95612", minimum: 40, fee: 1.99, window: "45–90 minutes" },
   { zip: "95693", minimum: 125, fee: 3.49, window: "120–240 minutes" },
   { zip: "95639", minimum: 80, fee: 3.49, window: "120–240 minutes" },
-  { zip: "95672", minimum: 80, fee: 1.99, window: "90–180 minutes" },
+  { zip: "95672", minimum: 80, fee: 1.99, window: "90–180 minutes" }
 ];
 
 let DELIVERY_TABLE = DEFAULT_DELIVERY_TABLE;
@@ -244,7 +241,7 @@ try {
 DELIVERY_TABLE = DELIVERY_TABLE.map(function (r) {
   return {
     ...r,
-    window: r.window || computeEtaWindow(r.minimum, r.zip),
+    window: r.window || computeEtaWindow(r.minimum, r.zip)
   };
 });
 
@@ -253,7 +250,7 @@ app.get("/health", function (_req, res) {
   res.json({ ok: true });
 });
 
-// ---------- Jane debug helpers ----------
+// ---------- Jane debug ----------
 app.get("/jane/debug", async function (_req, res) {
   const base = canonicalJaneBase(
     process.env.JANE_API_BASE || "https://pos.iheartjane.com"
@@ -270,20 +267,32 @@ app.get("/jane/debug", async function (_req, res) {
     storeId,
     tokenPresent,
     tokenLength,
-    lookupsEnabled: LOOKUPS_ON,
+    lookupsEnabled: LOOKUPS_ON
   });
 });
 
-// Simple debug: log sample names from Jane
+// /jane/test – quick product sampling
 app.get("/jane/test", async function (_req, res) {
   try {
     const items = await janeMenuSearch(50);
     console.log("=== /jane/test sample products ===");
-    items.slice(0, 20).forEach(function (it, idx) {
+    items.forEach(function (it, idx) {
       const name =
         (it && (it.name || it.product_name)) ||
         "";
-      console.log("[" + idx + "] name=" + JSON.stringify(name));
+      const brand =
+        (it && it.brand && it.brand.name) ||
+        it.brand_name ||
+        it.brand ||
+        "";
+      console.log(
+        "[" +
+          idx +
+          "] brand=" +
+          JSON.stringify(brand) +
+          " name=" +
+          JSON.stringify(name)
+      );
     });
     res.json({ ok: true, count: items.length });
   } catch (e) {
@@ -292,7 +301,7 @@ app.get("/jane/test", async function (_req, res) {
   }
 });
 
-// Show server's public IP for allowlisting (Jane / Cloudflare)
+// Whoami for allowlisting
 app.get("/whoami", async function (_req, res) {
   try {
     const r = await fetch("https://ifconfig.me/ip", { timeout: 3000 });
@@ -324,7 +333,7 @@ app.post("/twilio/voice", function (req, res) {
   res.type("text/xml").send(twiml);
 });
 
-// ---------- Transfer endpoint (TwiML) ----------
+// ---------- Transfer TwiML ----------
 app.post("/twilio/transfer", function (_req, res) {
   const vr = new twilio.twiml.VoiceResponse();
   vr.say("No problem. Transferring you now.");
@@ -332,7 +341,7 @@ app.post("/twilio/transfer", function (_req, res) {
   res.type("text/xml").send(vr.toString());
 });
 
-// ---------- Call status logs ----------
+// ---------- Call status ----------
 app.post("/twilio/status", function (req, res) {
   console.log(
     "Call status:",
@@ -373,7 +382,6 @@ wss.on("connection", async function (twilioWS) {
       return;
     }
 
-    // Capture CallSid on setup
     if (msg.type === "setup") {
       currentCallSid =
         msg.callSid ||
@@ -399,7 +407,7 @@ wss.on("connection", async function (twilioWS) {
           safeSend(twilioWS, {
             type: "text",
             token: brandVoice(msgOut),
-            last: true,
+            last: true
           });
           return;
         }
@@ -417,7 +425,7 @@ wss.on("connection", async function (twilioWS) {
           safeSend(twilioWS, {
             type: "text",
             token: brandVoice(reply),
-            last: true,
+            last: true
           });
         } catch (e) {
           clearTimeout(to);
@@ -427,21 +435,20 @@ wss.on("connection", async function (twilioWS) {
           safeSend(twilioWS, {
             type: "text",
             token: brandVoice(msgOut),
-            last: true,
+            last: true
           });
         }
         return;
       }
 
-      // 1) Local intents (fast path)
+      // 1) Local intents
       const local = handleLocalIntent(q);
 
-      // Immediate transfer branch
       if (local === "__TRANSFER_NOW__") {
         safeSend(twilioWS, {
           type: "text",
           token: brandVoice("No problem. Transferring you now."),
-          last: true,
+          last: true
         });
         try {
           await transferLiveCall(currentCallSid);
@@ -455,7 +462,7 @@ wss.on("connection", async function (twilioWS) {
                 speakPhone(TRANSFER_NUMBER) +
                 "."
             ),
-            last: true,
+            last: true
           });
         }
         return;
@@ -465,7 +472,7 @@ wss.on("connection", async function (twilioWS) {
         safeSend(twilioWS, {
           type: "text",
           token: brandVoice(local),
-          last: true,
+          last: true
         });
         return;
       }
@@ -475,7 +482,7 @@ wss.on("connection", async function (twilioWS) {
         safeSend(twilioWS, {
           type: "text",
           token: brandVoice("Sorry, I’m having trouble connecting right now."),
-          last: true,
+          last: true
         });
         return;
       }
@@ -485,7 +492,7 @@ wss.on("connection", async function (twilioWS) {
         safeSend(twilioWS, {
           type: "text",
           token: brandVoice(answer),
-          last: true,
+          last: true
         });
       } catch (e) {
         console.error("OpenAI HTTPS error:", e.message);
@@ -494,7 +501,7 @@ wss.on("connection", async function (twilioWS) {
           token: brandVoice(
             "Sorry, our assistant is currently busy. Please call back shortly."
           ),
-          last: true,
+          last: true
         });
       }
     }
@@ -625,7 +632,7 @@ function handleLocalIntent(q = "") {
   return null;
 }
 
-// ---------- OpenAI Chat fallback ----------
+// ---------- OpenAI ----------
 async function askOpenAI(userText) {
   const systemPrompt =
     "You are the Crystal Nugs Sacramento AI voice assistant. Speak in a warm, concierge tone. Keep sentences short. Use natural pauses. Never read raw URLs. Say \"Crystal Nugs dot com\" instead of a link. If asked for a person, say “No problem, transferring you now.” " +
@@ -649,16 +656,16 @@ async function askOpenAI(userText) {
     method: "POST",
     headers: {
       Authorization: "Bearer " + OPENAI_API_KEY,
-      "Content-Type": "application/json",
+      "Content-Type": "application/json"
     },
     body: JSON.stringify({
       model: OPENAI_CHAT_MODEL,
       temperature: 0.4,
       messages: [
         { role: "system", content: systemPrompt },
-        { role: "user", content: userText },
-      ],
-    }),
+        { role: "user", content: userText }
+      ]
+    })
   });
 
   if (!resp.ok) {
@@ -700,14 +707,15 @@ function canonicalJaneBase(input) {
 }
 
 /**
- * POS v3 Merchant Products endpoint with pagination:
- * GET /api/v3/merchants/{merchant_id}/products?page[size]=N&after_id=ID
+ * Merchant products with pagination + store filter:
+ * GET /api/v3/merchants/{merchant_id}/products?page[size]=N&store_ids[]=100
  */
 async function janeMenuSearch(limit = 400, signal) {
   const base = canonicalJaneBase(
     process.env.JANE_API_BASE || "https://pos.iheartjane.com"
   );
   const merchantId = process.env.JANE_MERCHANT_ID || "56";
+  const storeId = process.env.JANE_STORE_ID || "100";
   const token = process.env.JANE_API_TOKEN;
   if (!token || !merchantId) {
     throw new Error(
@@ -725,6 +733,9 @@ async function janeMenuSearch(limit = 400, signal) {
     page += 1;
     const url = new URL("/api/v3/merchants/" + merchantId + "/products", base);
     url.searchParams.set("page[size]", String(pageSize));
+    if (storeId) {
+      url.searchParams.set("store_ids[]", storeId);
+    }
     if (afterId) {
       url.searchParams.set("after_id", String(afterId));
     }
@@ -734,6 +745,8 @@ async function janeMenuSearch(limit = 400, signal) {
         page +
         ", after_id=" +
         (afterId || "none") +
+        ", store=" +
+        storeId +
         ", url=" +
         url.toString()
     );
@@ -742,9 +755,9 @@ async function janeMenuSearch(limit = 400, signal) {
       headers: {
         Authorization: "Bearer " + token,
         Accept: "application/json",
-        "User-Agent": "CrystalNugs-VoiceBot/1.0",
+        "User-Agent": "CrystalNugs-VoiceBot/1.0"
       },
-      signal,
+      signal
     });
 
     if (!resp.ok) {
@@ -806,9 +819,7 @@ function detectProductQuery(text = "") {
     )
   ) {
     category = "vape";
-  } else if (
-    /\b(pre[\s-]?rolls?|joints?|infused pre[\s-]?rolls?)\b/.test(t)
-  ) {
+  } else if (/\b(pre[\s-]?rolls?|joints?|infused pre[\s-]?rolls?)\b/.test(t)) {
     category = "pre-roll";
   } else if (
     /\b(edible|edibles|gummy|gummies|chocolate|cookie|drink|beverage)\b/.test(t)
@@ -824,7 +835,7 @@ function detectProductQuery(text = "") {
     { re: /\bmaven(\s+genetics)?\b/i, brand: "Maven" },
     { re: /\bstii?izy\b/i, brand: "STIIIZY" },
     { re: /\braw\s+garden\b/i, brand: "Raw Garden" },
-    { re: /\buncle\s+larry'?s?\b/i, brand: "Uncle Larry" },
+    { re: /\buncle\s+larry'?s?\b/i, brand: "Uncle Larry" }
   ];
 
   for (let i = 0; i < brandMap.length; i++) {
@@ -835,7 +846,7 @@ function detectProductQuery(text = "") {
         category: category,
         keyword: null,
         rawBrandToken: m[0],
-        rawText: raw,
+        rawText: raw
       };
     }
   }
@@ -853,7 +864,7 @@ function detectProductQuery(text = "") {
         category: category,
         keyword: null,
         rawBrandToken: candidate,
-        rawText: raw,
+        rawText: raw
       };
     }
   }
@@ -870,7 +881,7 @@ function detectProductQuery(text = "") {
       category: category || "pre-roll",
       keyword: capitalizeWords(term || "Gelato"),
       rawBrandToken: term || "",
-      rawText: raw,
+      rawText: raw
     };
   }
 
@@ -921,7 +932,18 @@ function capitalizeWords(str = "") {
     .join(" ");
 }
 
-// Extract brand from product name prefix: "STIIIZY - Orange Sunset ..." -> "STIIIZY"
+// Deep check: does "maven" / "stiiizy" appear anywhere in the item JSON?
+function itemContainsBrand(it, brandStr) {
+  const needle = String(brandStr || "").toLowerCase().trim();
+  if (!needle || !it) return false;
+  try {
+    const flat = JSON.stringify(it).toLowerCase();
+    return flat.indexOf(needle) !== -1;
+  } catch (_e) {
+    return false;
+  }
+}
+
 function extractItemBrand(it = {}) {
   const name = (
     (it && (it.name || it.product_name)) ||
@@ -929,18 +951,15 @@ function extractItemBrand(it = {}) {
   )
     .toString()
     .trim();
-
   if (!name) return "";
-
   const m = name.match(/^([A-Za-z0-9.'&\s]+?)\s*-\s+/);
   if (m && m[1]) {
     return m[1].trim();
   }
-
   return "";
 }
 
-// *** Don't treat missing/0 prices as $0 ***
+// Skip zero/missing prices
 function extractJanePriceCents(item = {}) {
   const direct =
     (item &&
@@ -962,34 +981,20 @@ function extractJanePriceCents(item = {}) {
   if (!isFinite(n) || n <= 0) {
     return null;
   }
-
   return n;
-}
-
-// Does this Jane item contain the brand string anywhere in its JSON?
-function itemContainsBrand(it, brandStr) {
-  const needle = String(brandStr || "").toLowerCase().trim();
-  if (!needle || !it) return false;
-
-  try {
-    const flat = JSON.stringify(it).toLowerCase();
-    return flat.indexOf(needle) !== -1;
-  } catch (_e) {
-    return false;
-  }
 }
 
 function filterJaneItemsByIntent(items = [], intent) {
   let list = Array.isArray(items) ? items.slice() : [];
 
- // --- BRAND FILTER (very forgiving) ---
-if (intent.brand) {
-  list = list.filter(function (it) {
-    return itemContainsBrand(it, intent.brand);
-  });
-}
+  // BRAND FILTER – very forgiving
+  if (intent.brand) {
+    list = list.filter(function (it) {
+      return itemContainsBrand(it, intent.brand);
+    });
+  }
 
-  // --- KEYWORD FILTER (e.g., "Gelato") ---
+  // KEYWORD FILTER
   if (intent.keyword) {
     const k = intent.keyword.toLowerCase();
     list = list.filter(function (it) {
@@ -1003,7 +1008,7 @@ if (intent.brand) {
     });
   }
 
-  // --- CATEGORY FILTER (flower / vape / pre-roll / edible) ---
+  // CATEGORY FILTER
   if (intent.category) {
     const c = intent.category;
     list = list.filter(function (it) {
@@ -1116,13 +1121,11 @@ function formatPriceRangeFromItems(items = []) {
   );
 }
 
-// Brands we know we carry in-store, even if Jane's API doesn't show them correctly
 const ALWAYS_CARRY_BRANDS = [
   "STIIIZY",
   "Maven",
   "Raw Garden",
-  "Uncle Larry",
-  // add more here as needed
+  "Uncle Larry"
 ];
 
 function summarizeBrandInventory(intent, rawItems = []) {
@@ -1135,7 +1138,7 @@ function summarizeBrandInventory(intent, rawItems = []) {
 
   const brandOnly = filterJaneItemsByIntent(allItems, {
     ...intent,
-    category: null,
+    category: null
   });
   console.log("Items for brand-only filter:", brandOnly.length);
 
@@ -1146,7 +1149,6 @@ function summarizeBrandInventory(intent, rawItems = []) {
     ? brandOnly.length > 0
     : matched.length > 0;
 
-  // No items at all from Jane
   if (!allItems.length) {
     if (intent.brand && ALWAYS_CARRY_BRANDS.includes(intent.brand)) {
       const catLabel = intent.category ? humanCategory(intent.category) : "items";
@@ -1166,7 +1168,6 @@ function summarizeBrandInventory(intent, rawItems = []) {
     );
   }
 
-  // Brand specified but ZERO products found for that brand in Jane data
   if (intent.brand && brandOnly.length === 0) {
     if (ALWAYS_CARRY_BRANDS.includes(intent.brand)) {
       const catLabel = intent.category ? humanCategory(intent.category) : "items";
@@ -1188,7 +1189,6 @@ function summarizeBrandInventory(intent, rawItems = []) {
     );
   }
 
-  // No explicit brand, nothing matching keyword/category
   if (!intent.brand && !hasAnyBrandItems) {
     return (
       "I’m not seeing that in our live menu data right now. " +
@@ -1197,7 +1197,6 @@ function summarizeBrandInventory(intent, rawItems = []) {
     );
   }
 
-  // They asked for a specific category of a brand, but Jane doesn't show that category
   if (intent.category && brandOnly.length > 0 && matched.length === 0) {
     const catLabel = humanCategory(intent.category);
 
@@ -1224,7 +1223,6 @@ function summarizeBrandInventory(intent, rawItems = []) {
     );
   }
 
-  // At this point we have real matches to work with
   let workingList;
   if (intent.category && matched.length > 0) {
     workingList = matched;
@@ -1345,7 +1343,6 @@ function venueLabel(opts) {
   return "restaurants, bars, and truck stops";
 }
 
-/** Brand voice (plain or SSML) */
 function brandVoice(raw = "") {
   const cleaned = toSpokenText(raw).trim();
 
