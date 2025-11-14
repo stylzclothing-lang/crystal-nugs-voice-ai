@@ -969,10 +969,27 @@ function extractJanePriceCents(item = {}) {
 function filterJaneItemsByIntent(items = [], intent) {
   let list = Array.isArray(items) ? items.slice() : [];
 
-  // Brand filter — use name prefix and substring in the name
+  // --- BRAND FILTER ---
   if (intent.brand) {
     const needle = intent.brand.toLowerCase();
     list = list.filter(function (it) {
+      // 1) Jane brand fields
+      const brandField = (
+        (it &&
+          it.brand &&
+          it.brand.name) ||
+        (it && it.brand_name) ||
+        (it && it.brand) ||
+        ""
+      )
+        .toString()
+        .toLowerCase();
+
+      if (brandField && brandField.indexOf(needle) !== -1) {
+        return true;
+      }
+
+      // 2) Product name text
       const nameText = (
         (it && (it.name || it.product_name)) ||
         ""
@@ -980,19 +997,23 @@ function filterJaneItemsByIntent(items = [], intent) {
         .toString()
         .toLowerCase();
 
-      if (!nameText) return false;
+      if (nameText && nameText.indexOf(needle) !== -1) {
+        return true;
+      }
 
-      // "stiiizy" anywhere in the product name
-      if (nameText.indexOf(needle) !== -1) return true;
-
-      // Extra: use prefix brand parser
-      const prefixBrand = extractItemBrand(it).toLowerCase();
-      if (prefixBrand && prefixBrand.indexOf(needle) !== -1) return true;
+      // 3) Prefix brand parsed from name like "STIIIZY - Orange Sunset ..."
+      const prefixBrand = extractItemBrand(it)
+        .toString()
+        .toLowerCase();
+      if (prefixBrand && prefixBrand.indexOf(needle) !== -1) {
+        return true;
+      }
 
       return false;
     });
   }
 
+  // --- KEYWORD FILTER (e.g., "Gelato") ---
   if (intent.keyword) {
     const k = intent.keyword.toLowerCase();
     list = list.filter(function (it) {
@@ -1006,6 +1027,7 @@ function filterJaneItemsByIntent(items = [], intent) {
     });
   }
 
+  // --- CATEGORY FILTER (flower / vape / pre-roll / edible) ---
   if (intent.category) {
     const c = intent.category;
     list = list.filter(function (it) {
