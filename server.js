@@ -258,7 +258,7 @@ app.get("/jane/debug", async function (_req, res) {
   const base = canonicalJaneBase(
     process.env.JANE_API_BASE || "https://pos.iheartjane.com"
   );
-  const merchantId = process.env.JANE_MERCHANT_ID || "724";
+  const merchantId = process.env.JANE_MERCHANT_ID || "56";
   const storeId = process.env.JANE_STORE_ID || "100";
   const tokenPresent = !!process.env.JANE_API_TOKEN;
   const tokenLength = process.env.JANE_API_TOKEN
@@ -274,11 +274,11 @@ app.get("/jane/debug", async function (_req, res) {
   });
 });
 
-// Simple debug: log sample brands from Jane
+// Simple debug: log sample names from Jane
 app.get("/jane/test", async function (_req, res) {
   try {
     const items = await janeMenuSearch(50);
-    console.log("=== /jane/test sample brands ===");
+    console.log("=== /jane/test sample products ===");
     items.slice(0, 20).forEach(function (it, idx) {
       const name =
         (it && (it.name || it.product_name)) ||
@@ -707,7 +707,7 @@ async function janeMenuSearch(limit = 400, signal) {
   const base = canonicalJaneBase(
     process.env.JANE_API_BASE || "https://pos.iheartjane.com"
   );
-  const merchantId = process.env.JANE_MERCHANT_ID || "724";
+  const merchantId = process.env.JANE_MERCHANT_ID || "56";
   const token = process.env.JANE_API_TOKEN;
   if (!token || !merchantId) {
     throw new Error(
@@ -1118,6 +1118,15 @@ function formatPriceRangeFromItems(items = []) {
   );
 }
 
+// Brands we know we carry in-store, even if Jane's API doesn't show them correctly
+const ALWAYS_CARRY_BRANDS = [
+  "STIIIZY",
+  "Maven",
+  "Raw Garden",
+  "Uncle Larry",
+  // add more here as needed
+];
+
 function summarizeBrandInventory(intent, rawItems = []) {
   const brandLabel = intent.brand || intent.keyword || "that brand";
   const allItems = Array.isArray(rawItems) ? rawItems : [];
@@ -1126,14 +1135,12 @@ function summarizeBrandInventory(intent, rawItems = []) {
   console.log("User intent:", intent);
   console.log("Total items returned from Jane:", allItems.length);
 
-  // Filter by brand only (no category)
   const brandOnly = filterJaneItemsByIntent(allItems, {
     ...intent,
     category: null,
   });
   console.log("Items for brand-only filter:", brandOnly.length);
 
-  // Filter by brand + category (if category specified)
   const matched = filterJaneItemsByIntent(allItems, intent);
   console.log("Items after brand + category filter:", matched.length);
 
@@ -1141,35 +1148,85 @@ function summarizeBrandInventory(intent, rawItems = []) {
     ? brandOnly.length > 0
     : matched.length > 0;
 
+  // No items at all from Jane
   if (!allItems.length) {
-    return "I’m not seeing any items come back from our menu system right now. It might be updating. Please check Crystal Nugs dot com for the live menu or ask a budtender.";
+    if (intent.brand && ALWAYS_CARRY_BRANDS.includes(intent.brand)) {
+      const catLabel = intent.category ? humanCategory(intent.category) : "items";
+      return (
+        "Yes — we carry " +
+        brandLabel +
+        " " +
+        catLabel +
+        ". Our live menu system isn’t responding right now. " +
+        "Please check Crystal Nugs dot com or ask your budtender for exact strains and prices."
+      );
+    }
+
+    return (
+      "I’m not seeing any items come back from our menu system right now. " +
+      "It might be updating. Please check Crystal Nugs dot com for the live menu or ask a budtender."
+    );
   }
 
+  // Brand specified but ZERO products found for that brand in Jane data
   if (intent.brand && brandOnly.length === 0) {
+    if (ALWAYS_CARRY_BRANDS.includes(intent.brand)) {
+      const catLabel = intent.category ? humanCategory(intent.category) : "items";
+      return (
+        "Yes — we carry " +
+        brandLabel +
+        " " +
+        catLabel +
+        ". I can’t see the live counts from Jane’s system right now, " +
+        "so for exact strains and prices please check Crystal Nugs dot com or ask your budtender."
+      );
+    }
+
     return (
       "I’m not seeing " +
       brandLabel +
-      " in our live menu data right now. It might be sold out or not something we carry at the moment. Please double check on Crystal Nugs dot com or with a budtender for the most accurate info."
+      " in our live menu data right now. It might be sold out or not something we carry at the moment. " +
+      "Please double check on Crystal Nugs dot com or with a budtender for the most accurate info."
     );
   }
 
+  // No explicit brand, nothing matching keyword/category
   if (!intent.brand && !hasAnyBrandItems) {
     return (
-      "I’m not seeing that in our live menu data right now. It might be sold out or not something we carry at the moment. Please double check on Crystal Nugs dot com or with a budtender for the most accurate info."
+      "I’m not seeing that in our live menu data right now. " +
+      "It might be sold out or not something we carry at the moment. " +
+      "Please double check on Crystal Nugs dot com or with a budtender for the most accurate info."
     );
   }
 
+  // They asked for a specific category of a brand, but Jane doesn't show that category
   if (intent.category && brandOnly.length > 0 && matched.length === 0) {
     const catLabel = humanCategory(intent.category);
+
+    if (ALWAYS_CARRY_BRANDS.includes(intent.brand)) {
+      return (
+        "Yes — we do carry " +
+        brandLabel +
+        ", but I’m not seeing " +
+        catLabel +
+        " in our live menu snapshot right now. " +
+        "Please check Crystal Nugs dot com or ask your budtender to confirm which " +
+        catLabel +
+        " are in stock."
+      );
+    }
+
     return (
       "I’m not seeing " +
       brandLabel +
       " " +
       catLabel +
-      " in our live menu data right now. It might be sold out at the moment. Please double check on Crystal Nugs dot com or with a budtender for the most accurate info."
+      " in our live menu data right now. It might be sold out at the moment. " +
+      "Please double check on Crystal Nugs dot com or with a budtender for the most accurate info."
     );
   }
 
+  // At this point we have real matches to work with
   let workingList;
   if (intent.category && matched.length > 0) {
     workingList = matched;
