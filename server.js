@@ -966,52 +966,28 @@ function extractJanePriceCents(item = {}) {
   return n;
 }
 
+// Does this Jane item contain the brand string anywhere in its JSON?
+function itemContainsBrand(it, brandStr) {
+  const needle = String(brandStr || "").toLowerCase().trim();
+  if (!needle || !it) return false;
+
+  try {
+    const flat = JSON.stringify(it).toLowerCase();
+    return flat.indexOf(needle) !== -1;
+  } catch (_e) {
+    return false;
+  }
+}
+
 function filterJaneItemsByIntent(items = [], intent) {
   let list = Array.isArray(items) ? items.slice() : [];
 
-  // --- BRAND FILTER ---
-  if (intent.brand) {
-    const needle = intent.brand.toLowerCase();
-    list = list.filter(function (it) {
-      // 1) Jane brand fields
-      const brandField = (
-        (it &&
-          it.brand &&
-          it.brand.name) ||
-        (it && it.brand_name) ||
-        (it && it.brand) ||
-        ""
-      )
-        .toString()
-        .toLowerCase();
-
-      if (brandField && brandField.indexOf(needle) !== -1) {
-        return true;
-      }
-
-      // 2) Product name text
-      const nameText = (
-        (it && (it.name || it.product_name)) ||
-        ""
-      )
-        .toString()
-        .toLowerCase();
-
-      if (nameText && nameText.indexOf(needle) !== -1) {
-        return true;
-      }
-
-      // 3) Prefix brand parsed from name like "STIIIZY - Orange Sunset ..."
-      const prefixBrand = extractItemBrand(it)
-        .toString()
-        .toLowerCase();
-      if (prefixBrand && prefixBrand.indexOf(needle) !== -1) {
-        return true;
-      }
-
-      return false;
-    });
-  }
+ // --- BRAND FILTER (very forgiving) ---
+if (intent.brand) {
+  list = list.filter(function (it) {
+    return itemContainsBrand(it, intent.brand);
+  });
+}
 
   // --- KEYWORD FILTER (e.g., "Gelato") ---
   if (intent.keyword) {
