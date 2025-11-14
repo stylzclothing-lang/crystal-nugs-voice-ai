@@ -277,10 +277,10 @@ app.get("/whoami", async (_req, res) => {
   }
 });
 
-// Quick Jane test — just pull first 3 products for this merchant
+// Quick Jane test — just pull first few products for this merchant
 app.get("/jane/test", async (_req, res) => {
   try {
-    const items = await janeMenuSearch("", 3); // first page products
+    const items = await janeMenuSearch(10);
     res.json({ ok: true, sample: items });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -381,11 +381,11 @@ wss.on("connection", async (twilioWS) => {
         }
 
         const ac = new AbortController();
-        const to = setTimeout(() => ac.abort(), 7000);
+        const to = setTimeout(() => ac.abort(), 8000);
 
         try {
-          // We ignore q on the Jane side now and always filter locally
-          const items = await janeMenuSearch("", 100, ac.signal);
+          // Pull up to ~400 products and filter locally
+          const items = await janeMenuSearch(400, ac.signal);
           clearTimeout(to);
 
           const reply = summarizeBrandInventory(productIntent, items);
@@ -631,9 +631,15 @@ function canonicalJaneBase(input) {
   return u.replace(/\/+$/, "");
 }
 
-// POS v3 Merchant Products endpoint (local filtering, no server-side q):
-// GET /api/v3/merchants/{merchant_id}/products?page[size]=N
-async function janeMenuSearch(_q, limit = 100, signal) {
+/**
+ * POS v3 Merchant Products endpoint with pagination:
+ * GET /api/v3/merchants/{merchant_id}/products?page[size]=N&after_id=ID
+ *
+ * We IGNORE any search term on the server side and always pull a wide slice,
+ * then filter in Node so brands like Maven / Raw Garden / Uncle Larry
+ * aren't missed due to Jane's internal search quirks.
+ */
+async function janeMenuSearch(limit = 400, signal) {
   const base = canonicalJaneBase(
     process.env.JANE_API_BASE || "https://pos.iheartjane.com"
   );
@@ -643,35 +649,66 @@ async function janeMenuSearch(_q, limit = 100, signal) {
     throw new Error("Missing Jane POS env vars (JANE_API_TOKEN, JANE_MERCHANT_ID)");
   }
 
-  const url = new URL(`/api/v3/merchants/${merchantId}/products`, base);
-  url.searchParams.set("page[size]", String(limit));
+  const maxLimit = Math.max(1, Math.min(Number(limit) || 400, 400));
+  const pageSize = 100; // typical max page size
+  const results = [];
+  let afterId = null;
+  let page = 0;
 
-  const resp = await fetch(url.toString(), {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/json",
-      "User-Agent": "CrystalNugs-VoiceBot/1.0",
-    },
-    signal,
-  });
+  while (results.length < maxLimit) {
+    page += 1;
+    const url = new URL(`/api/v3/merchants/${merchantId}/products`, base);
+    url.searchParams.set("page[size]", String(pageSize));
+    if (afterId) {
+      url.searchParams.set("after_id", String(afterId));
+    }
 
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    if (resp.status === 401) {
-      throw new Error("Jane 401: Invalid API token for POS v3.");
+    console.log(
+      `Jane fetch page ${page}, after_id=${afterId || "none"}, url=${url.toString()}`
+    );
+
+    const resp = await fetch(url.toString(), {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        "User-Agent": "CrystalNugs-VoiceBot/1.0",
+      },
+      signal,
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      if (resp.status === 401) {
+        throw new Error("Jane 401: Invalid API token for POS v3.");
+      }
+      if (resp.status === 403 || /cloudflare/i.test(text)) {
+        throw new Error(
+          "Jane API blocked (403). Ask your Jane rep to allowlist your server IP and confirm POS API scopes."
+        );
+      }
+      throw new Error(`Jane ${resp.status}: ${text.slice(0, 300)}`);
     }
-    if (resp.status === 403 || /cloudflare/i.test(text)) {
-      throw new Error(
-        "Jane API blocked (403). Ask your Jane rep to allowlist your server IP and confirm POS API scopes."
-      );
+
+    const data = await resp.json().catch(() => null);
+    let items = Array.isArray(data) ? data : data?.data || data?.items || [];
+
+    if (!Array.isArray(items) || !items.length) {
+      break; // no more pages
     }
-    throw new Error(`Jane ${resp.status}: ${text.slice(0, 300)}`);
+
+    results.push(...items);
+
+    // figure out the next after_id
+    const last = items[items.length - 1];
+    const nextId = last?.id ?? last?.product_id ?? null;
+    if (!nextId) break;
+    afterId = nextId;
+
+    if (items.length < pageSize) break; // last partial page
   }
 
-  let data = await resp.json();
-  let items = Array.isArray(data) ? data : data?.data || data?.items || [];
-
-  return items;
+  console.log("Jane total fetched products:", results.length);
+  return results.slice(0, maxLimit);
 }
 
 // ---------- Inventory + brand/category detection ----------
@@ -1000,7 +1037,7 @@ function summarizeBrandInventory(intent, rawItems = []) {
   // No items at all for that brand/keyword
   if (!hasAnyBrandItems) {
     if (isCoreBrand) {
-      // You know you carry this, even if Jane didn't return it for this page/search
+      // You know you carry this, even if Jane didn't return it in this slice
       if (intent.category) {
         const catLabel = humanCategory(intent.category);
         return `We do carry ${brandLabel} ${catLabel}, but I’m not seeing them in our live menu data at this moment. Inventory updates often. For exact options and pricing, please check Crystal Nugs dot com or ask a budtender in-store.`;
