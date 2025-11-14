@@ -1,4 +1,4 @@
-// server.js — Crystal Nugs Voice AI (Google en-US-Wavenet-F) + Jane POS v3 Merchant Products + Live Transfer
+// server.js — Crystal Nugs Voice AI + Jane POS v3 Merchant Products + Live Transfer
 // ConversationRelay + Product search (iHeartJane POS v3) + Local Intents (ZIP-aware mins/fees/ETA) + Venue answers + OpenAI fallback
 // Includes: URL/email sanitizer, SSML brand voice (optional), robust logging, in-call transfer
 
@@ -61,7 +61,9 @@ function speakPhone(e164 = "+19167019777") {
       ? [digits.slice(0, 3), digits.slice(3, 6), digits.slice(6)]
       : [digits];
   return parts
-    .map((seg) => seg.split("").join("-") + ",")
+    .map(function (seg) {
+      return seg.split("").join("-") + ",";
+    })
     .join(" ")
     .replace(/,\s*$/, "");
 }
@@ -272,6 +274,24 @@ app.get("/jane/debug", async function (_req, res) {
   });
 });
 
+// Simple debug: log sample brands from Jane
+app.get("/jane/test", async function (_req, res) {
+  try {
+    const items = await janeMenuSearch(50);
+    console.log("=== /jane/test sample brands ===");
+    items.slice(0, 20).forEach(function (it, idx) {
+      const name =
+        (it && (it.name || it.product_name)) ||
+        "";
+      console.log("[" + idx + "] name=" + JSON.stringify(name));
+    });
+    res.json({ ok: true, count: items.length });
+  } catch (e) {
+    console.error("Error in /jane/test:", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // Show server's public IP for allowlisting (Jane / Cloudflare)
 app.get("/whoami", async function (_req, res) {
   try {
@@ -280,16 +300,6 @@ app.get("/whoami", async function (_req, res) {
     res.json({ ip: ip.trim() });
   } catch (e) {
     res.status(500).json({ error: e.message });
-  }
-});
-
-// Quick Jane test — pull a slice of products
-app.get("/jane/test", async function (_req, res) {
-  try {
-    const items = await janeMenuSearch(50);
-    res.json({ ok: true, sample: items });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
@@ -324,7 +334,11 @@ app.post("/twilio/transfer", function (_req, res) {
 
 // ---------- Call status logs ----------
 app.post("/twilio/status", function (req, res) {
-  console.log("Call status:", req.body && req.body.CallStatus, req.body && req.body.CallSid);
+  console.log(
+    "Call status:",
+    req.body && req.body.CallStatus,
+    req.body && req.body.CallSid
+  );
   res.sendStatus(200);
 });
 
@@ -364,7 +378,9 @@ wss.on("connection", async function (twilioWS) {
       currentCallSid =
         msg.callSid ||
         (msg.start && msg.start.callSid) ||
-        (msg.start && msg.start.twilio && msg.start.twilio.callSid) ||
+        (msg.start &&
+          msg.start.twilio &&
+          msg.start.twilio.callSid) ||
         null;
       console.log("Setup received. CallSid:", currentCallSid);
       return;
@@ -749,7 +765,9 @@ async function janeMenuSearch(limit = 400, signal) {
     const data = await resp.json().catch(function () {
       return null;
     });
-    let items = Array.isArray(data) ? data : (data && data.data) || data?.items || [];
+    let items = Array.isArray(data)
+      ? data
+      : (data && data.data) || (data && data.items) || [];
 
     if (!Array.isArray(items) || !items.length) {
       break;
@@ -758,7 +776,7 @@ async function janeMenuSearch(limit = 400, signal) {
     results.push.apply(results, items);
 
     const last = items[items.length - 1];
-    const nextId = (last && last.id) || last?.product_id || null;
+    const nextId = last && (last.id || last.product_id);
     if (!nextId) break;
     afterId = nextId;
 
@@ -840,8 +858,13 @@ function detectProductQuery(text = "") {
     }
   }
 
-  if ((askedCarry || category) && /\b(gelato|zkittlez|blueberry|infused)\b/i.test(normalized)) {
-    const term = normalized.match(/\b(gelato|zkittlez|blueberry|infused)\b/i)[0];
+  if (
+    (askedCarry || category) &&
+    /\b(gelato|zkittlez|blueberry|infused)\b/i.test(normalized)
+  ) {
+    const term = normalized.match(
+      /\b(gelato|zkittlez|blueberry|infused)\b/i
+    )[0];
     return {
       brand: null,
       category: category || "pre-roll",
@@ -898,19 +921,15 @@ function capitalizeWords(str = "") {
     .join(" ");
 }
 
-// Try to extract a brand name from a Jane item.
+// Extract brand from product name prefix: "STIIIZY - Orange Sunset ..." -> "STIIIZY"
 function extractItemBrand(it = {}) {
-  const explicit =
-    (it &&
-      (it.brand && it.brand.name
-        ? it.brand.name
-        : it.brand_name || it.brand)) ||
-    "";
+  const name = (
+    (it && (it.name || it.product_name)) ||
+    ""
+  )
+    .toString()
+    .trim();
 
-  let brand = String(explicit).trim();
-  if (brand) return brand;
-
-  const name = ((it && (it.name || it.product_name)) || "").toString().trim();
   if (!name) return "";
 
   const m = name.match(/^([A-Za-z0-9.'&\s]+?)\s*-\s+/);
@@ -950,15 +969,27 @@ function extractJanePriceCents(item = {}) {
 function filterJaneItemsByIntent(items = [], intent) {
   let list = Array.isArray(items) ? items.slice() : [];
 
-  // Brand filter — now looks in brand fields AND product name text
+  // Brand filter — use name prefix and substring in the name
   if (intent.brand) {
     const needle = intent.brand.toLowerCase();
     list = list.filter(function (it) {
-      const brandText = extractItemBrand(it);
-      const nameText = ((it && (it.name || it.product_name)) || "").toString();
-      const combined = (brandText + " " + nameText).toLowerCase();
-      if (!combined) return false;
-      return combined.indexOf(needle) !== -1;
+      const nameText = (
+        (it && (it.name || it.product_name)) ||
+        ""
+      )
+        .toString()
+        .toLowerCase();
+
+      if (!nameText) return false;
+
+      // "stiiizy" anywhere in the product name
+      if (nameText.indexOf(needle) !== -1) return true;
+
+      // Extra: use prefix brand parser
+      const prefixBrand = extractItemBrand(it).toLowerCase();
+      if (prefixBrand && prefixBrand.indexOf(needle) !== -1) return true;
+
+      return false;
     });
   }
 
@@ -1037,7 +1068,11 @@ function collectStrainCount(items = []) {
   for (let i = 0; i < items.length; i++) {
     const it = items[i];
     const rawName =
-      ((it && (it.strain || it.strain_name || it.name || it.product_name)) ||
+      ((it &&
+        (it.strain ||
+          it.strain_name ||
+          it.name ||
+          it.product_name)) ||
         "") + "";
     const cleaned = rawName
       .replace(
@@ -1106,12 +1141,10 @@ function summarizeBrandInventory(intent, rawItems = []) {
     ? brandOnly.length > 0
     : matched.length > 0;
 
-  // If Jane returned absolutely nothing, don't guess
   if (!allItems.length) {
     return "I’m not seeing any items come back from our menu system right now. It might be updating. Please check Crystal Nugs dot com for the live menu or ask a budtender.";
   }
 
-  // If we have a brand in the question but brand-only is empty:
   if (intent.brand && brandOnly.length === 0) {
     return (
       "I’m not seeing " +
@@ -1120,14 +1153,12 @@ function summarizeBrandInventory(intent, rawItems = []) {
     );
   }
 
-  // If no brand in question and no matches at all:
   if (!intent.brand && !hasAnyBrandItems) {
     return (
       "I’m not seeing that in our live menu data right now. It might be sold out or not something we carry at the moment. Please double check on Crystal Nugs dot com or with a budtender for the most accurate info."
     );
   }
 
-  // Category requested but category-filtered list is empty → brand exists, but not that category
   if (intent.category && brandOnly.length > 0 && matched.length === 0) {
     const catLabel = humanCategory(intent.category);
     return (
@@ -1139,7 +1170,6 @@ function summarizeBrandInventory(intent, rawItems = []) {
     );
   }
 
-  // Choose working list: category matches when available, else brand-only
   let workingList;
   if (intent.category && matched.length > 0) {
     workingList = matched;
@@ -1208,9 +1238,11 @@ function extractZip(text = "") {
 }
 
 function deliveryByZip(zip) {
-  return DELIVERY_TABLE.find(function (r) {
-    return r.zip === zip;
-  }) || null;
+  return (
+    DELIVERY_TABLE.find(function (r) {
+      return r.zip === zip;
+    }) || null
+  );
 }
 
 function formatMoney(n) {
