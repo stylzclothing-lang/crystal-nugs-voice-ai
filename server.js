@@ -35,7 +35,7 @@ const LOOKUPS_ON =
 function normalizeBaseUrl(u) {
   let s = String(u || "").trim();
   if (!s) return "";
-  if (!/^https?:\/\//i.test(s)) s = `https://${s}`;
+  if (!/^https?:\/\//i.test(s)) s = "https://" + s;
   s = s.replace(/^https?:\/\/https?:\/\//i, "https://");
   s = s.replace(/\/+$/g, "");
   return s;
@@ -47,8 +47,8 @@ const BASE_URL = normalizeBaseUrl(
 
 function absUrl(path = "/") {
   const base = BASE_URL || "https://crystal-nugs-voice-ai.onrender.com";
-  const p = path.startsWith("/") ? path : `/${path}`;
-  const url = `${base}${p}`;
+  const p = path.startsWith("/") ? path : "/" + path;
+  const url = base + p;
   return url.replace(/^https?:\/\/https?:\/\//i, "https://");
 }
 
@@ -71,8 +71,9 @@ async function transferLiveCall(callSid) {
   if (!callSid) throw new Error("Missing CallSid for transfer");
   const ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
   const AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-  if (!ACCOUNT_SID || !AUTH_TOKEN)
+  if (!ACCOUNT_SID || !AUTH_TOKEN) {
     throw new Error("Missing Twilio creds (Account SID/Auth Token)");
+  }
 
   const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
   const TRANSFER_URL = absUrl("/twilio/transfer");
@@ -238,20 +239,24 @@ try {
   // keep default
 }
 
-DELIVERY_TABLE = DELIVERY_TABLE.map((r) => ({
-  ...r,
-  window: r.window || computeEtaWindow(r.minimum, r.zip),
-}));
+DELIVERY_TABLE = DELIVERY_TABLE.map(function (r) {
+  return {
+    ...r,
+    window: r.window || computeEtaWindow(r.minimum, r.zip),
+  };
+});
 
 // ---------- Health ----------
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/health", function (_req, res) {
+  res.json({ ok: true });
+});
 
 // ---------- Jane debug helpers ----------
-app.get("/jane/debug", async (_req, res) => {
+app.get("/jane/debug", async function (_req, res) {
   const base = canonicalJaneBase(
     process.env.JANE_API_BASE || "https://pos.iheartjane.com"
   );
-  const merchantId = process.env.JANE_MERCHANT_ID || "724"; // default 724
+  const merchantId = process.env.JANE_MERCHANT_ID || "724";
   const storeId = process.env.JANE_STORE_ID || "100";
   const tokenPresent = !!process.env.JANE_API_TOKEN;
   const tokenLength = process.env.JANE_API_TOKEN
@@ -268,7 +273,7 @@ app.get("/jane/debug", async (_req, res) => {
 });
 
 // Show server's public IP for allowlisting (Jane / Cloudflare)
-app.get("/whoami", async (_req, res) => {
+app.get("/whoami", async function (_req, res) {
   try {
     const r = await fetch("https://ifconfig.me/ip", { timeout: 3000 });
     const ip = await r.text();
@@ -278,10 +283,10 @@ app.get("/whoami", async (_req, res) => {
   }
 });
 
-// Quick Jane test — just pull first few products for this merchant
-app.get("/jane/test", async (_req, res) => {
+// Quick Jane test — pull a slice of products
+app.get("/jane/test", async function (_req, res) {
   try {
-    const items = await janeMenuSearch(10);
+    const items = await janeMenuSearch(50);
     res.json({ ok: true, sample: items });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -289,27 +294,28 @@ app.get("/jane/test", async (_req, res) => {
 });
 
 // ---------- Voice Webhook ----------
-app.post("/twilio/voice", (req, res) => {
-  const wsUrl = `wss://${req.get("host")}/relay`;
+app.post("/twilio/voice", function (req, res) {
+  const wsUrl = "wss://" + req.get("host") + "/relay";
   const greeting =
     "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?";
 
-  const twiml = `<Response>
-      <Connect>
-        <ConversationRelay
-          url="${wsUrl}"
-          ttsProvider="Google"
-          voice="en-US-Wavenet-F"
-          welcomeGreeting="${escapeXml(greeting)}" />
-      </Connect>
-    </Response>`;
+  const twiml =
+    "<Response>" +
+    "<Connect>" +
+    '<ConversationRelay url="' +
+    escapeXml(wsUrl) +
+    '" ttsProvider="Google" voice="en-US-Wavenet-F" welcomeGreeting="' +
+    escapeXml(greeting) +
+    '" />' +
+    "</Connect>" +
+    "</Response>";
 
   console.log("Serving /twilio/voice TwiML:\n", twiml);
   res.type("text/xml").send(twiml);
 });
 
 // ---------- Transfer endpoint (TwiML) ----------
-app.post("/twilio/transfer", (_req, res) => {
+app.post("/twilio/transfer", function (_req, res) {
   const vr = new twilio.twiml.VoiceResponse();
   vr.say("No problem. Transferring you now.");
   vr.dial(TRANSFER_NUMBER);
@@ -317,35 +323,35 @@ app.post("/twilio/transfer", (_req, res) => {
 });
 
 // ---------- Call status logs ----------
-app.post("/twilio/status", (req, res) => {
-  console.log("Call status:", req.body?.CallStatus, req.body?.CallSid);
+app.post("/twilio/status", function (req, res) {
+  console.log("Call status:", req.body && req.body.CallStatus, req.body && req.body.CallSid);
   res.sendStatus(200);
 });
 
 // ---------- Start HTTP ----------
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, function () {
   console.log("Server listening on port", PORT);
 });
 
-server.on("upgrade", (req) => {
+server.on("upgrade", function (req) {
   console.log("HTTP upgrade (WS) ->", req.url);
 });
 
 // ---------- WebSocket Bridge ----------
 const wss = new WebSocketServer({ server, path: "/relay" });
 
-wss.on("error", (err) => {
-  console.error("WSS server error:", err?.message || err);
+wss.on("error", function (err) {
+  console.error("WSS server error:", (err && err.message) || err);
 });
 
-wss.on("connection", async (twilioWS) => {
+wss.on("connection", async function (twilioWS) {
   console.log(
     "Twilio connected to Conversation Relay (HTTPS Chat + local intents)"
   );
 
   let currentCallSid = null;
 
-  twilioWS.on("message", async (buf) => {
+  twilioWS.on("message", async function (buf) {
     let msg;
     try {
       msg = JSON.parse(buf.toString());
@@ -356,7 +362,10 @@ wss.on("connection", async (twilioWS) => {
     // Capture CallSid on setup
     if (msg.type === "setup") {
       currentCallSid =
-        msg.callSid || msg.start?.callSid || msg.start?.twilio?.callSid || null;
+        msg.callSid ||
+        (msg.start && msg.start.callSid) ||
+        (msg.start && msg.start.twilio && msg.start.twilio.callSid) ||
+        null;
       console.log("Setup received. CallSid:", currentCallSid);
       return;
     }
@@ -366,9 +375,7 @@ wss.on("connection", async (twilioWS) => {
       const q = userText.toLowerCase();
       console.log("Caller said:", userText);
 
-      // -------------------------
       // 0) Product lookup via Jane POS v3 BEFORE local intents
-      // -------------------------
       const productIntent = detectProductQuery(q);
       if (productIntent) {
         if (!LOOKUPS_ON) {
@@ -382,10 +389,11 @@ wss.on("connection", async (twilioWS) => {
         }
 
         const ac = new AbortController();
-        const to = setTimeout(() => ac.abort(), 8000);
+        const to = setTimeout(function () {
+          ac.abort();
+        }, 8000);
 
         try {
-          // Pull up to ~400 products and filter locally
           const items = await janeMenuSearch(400, ac.signal);
           clearTimeout(to);
 
@@ -427,9 +435,9 @@ wss.on("connection", async (twilioWS) => {
           safeSend(twilioWS, {
             type: "text",
             token: brandVoice(
-              `I couldn’t transfer the call just now. Here’s our direct line: ${speakPhone(
-                TRANSFER_NUMBER
-              )}.`
+              "I couldn’t transfer the call just now. Here’s our direct line: " +
+                speakPhone(TRANSFER_NUMBER) +
+                "."
             ),
             last: true,
           });
@@ -476,12 +484,12 @@ wss.on("connection", async (twilioWS) => {
     }
   });
 
-  twilioWS.on("error", (err) => {
-    console.error("Twilio WS error:", err?.message || err);
+  twilioWS.on("error", function (err) {
+    console.error("Twilio WS error:", (err && err.message) || err);
   });
 
-  twilioWS.on("close", (code, reason) => {
-    console.log("Twilio WS closed:", code, reason?.toString());
+  twilioWS.on("close", function (code, reason) {
+    console.log("Twilio WS closed:", code, reason && reason.toString());
   });
 });
 
@@ -489,20 +497,17 @@ wss.on("connection", async (twilioWS) => {
 function handleLocalIntent(q = "") {
   const maybeZip = extractZip(q);
 
-  // Ask-for-human (explicit)
   const wantsHuman =
     /\b(representative|agent|human|person|operator|manager|associate|someone|live\s*agent)\b/.test(
       q
     );
   if (wantsHuman) return "__TRANSFER_NOW__";
 
-  // Delivery question types
   const asksMin = /\b(min|minimum|order minimum|what.*minimum)\b/.test(q);
   const asksFee = /\b(fee|delivery fee|charge|cost)\b/.test(q);
   const asksDelivery =
     /\b(deliver|delivery|zone|area|order|eta|time|how long|arrive)\b/.test(q);
 
-  // Explicit "deliver to" phrasing
   const asksDeliverTo =
     /\b(can|do|will|y['’]?all|you)\s*(?:.*\s)?(deliver|drop\s?off|bring|meet)\s*(?:to|at)\b/.test(
       q
@@ -510,7 +515,6 @@ function handleLocalIntent(q = "") {
     /\bdeliver\s*(?:to|at)\b/.test(q) ||
     /\bdo you deliver\b/.test(q);
 
-  // Venue detection
   const mentionsHotel =
     /\b(hotel|motel|inn|suite|resort|lodg(e|ing)|air\s?bnb|airbnb)\b/.test(q);
   const mentionsVenue =
@@ -518,7 +522,6 @@ function handleLocalIntent(q = "") {
       q
     );
 
-  // ONLY when they explicitly ask "deliver to" one of these venues
   if (asksDeliverTo && (mentionsHotel || mentionsVenue)) {
     const z = maybeZip ? speakZip(maybeZip) : null;
     const placeLabel = venueLabel({ mentionsHotel, mentionsVenue });
@@ -529,15 +532,36 @@ function handleLocalIntent(q = "") {
         const min = formatMoney(rec.minimum);
         const fee = formatMoney(rec.fee);
         const win = rec.window || computeEtaWindow(rec.minimum, maybeZip);
-        return `Yes — we deliver to ${placeLabel} in ZIP ${z}. ETA ${win}. Minimum ${min}. Fee ${fee}. ${LAST_CALL}`;
+        return (
+          "Yes — we deliver to " +
+          placeLabel +
+          " in ZIP " +
+          z +
+          ". ETA " +
+          win +
+          ". Minimum " +
+          min +
+          ". Fee " +
+          fee +
+          ". " +
+          LAST_CALL
+        );
       }
-      return `Yes — we deliver to ${placeLabel} in that area. For ZIP ${z}, I don’t have a record on file. Share a nearby ZIP and I’ll confirm ETA, minimum, and fee.`;
+      return (
+        "Yes — we deliver to " +
+        placeLabel +
+        " in that area. For ZIP " +
+        z +
+        ", I don’t have a record on file. Share a nearby ZIP and I’ll confirm ETA, minimum, and fee."
+      );
     }
 
-    return `${DELIVERY_PLACES} What’s your 5-digit ZIP so I can confirm ETA, minimum, and fee? For example: 9-5-8-1-6.`;
+    return (
+      DELIVERY_PLACES +
+      " What’s your 5-digit ZIP so I can confirm ETA, minimum, and fee? For example: 9-5-8-1-6."
+    );
   }
 
-  // ZIP-specific minimum/fee/ETA when they ask about delivery details
   if ((asksMin || asksFee || asksDelivery) && maybeZip) {
     const rec = deliveryByZip(maybeZip);
     const z = speakZip(maybeZip);
@@ -545,24 +569,37 @@ function handleLocalIntent(q = "") {
       const min = formatMoney(rec.minimum);
       const fee = formatMoney(rec.fee);
       const win = rec.window || computeEtaWindow(rec.minimum, maybeZip);
-      return `For ZIP ${z}: estimated delivery ${win}. Delivery minimum ${min}. Delivery fee ${fee}. ${LAST_CALL}`;
+      return (
+        "For ZIP " +
+        z +
+        ": estimated delivery " +
+        win +
+        ". Delivery minimum " +
+        min +
+        ". Delivery fee " +
+        fee +
+        ". " +
+        LAST_CALL
+      );
     }
-    return `For ZIP ${z}: I don’t have a set delivery policy. Share a nearby ZIP and I’ll confirm your window, minimum, and fee.`;
+    return (
+      "For ZIP " +
+      z +
+      ": I don’t have a set delivery policy. Share a nearby ZIP and I’ll confirm your window, minimum, and fee."
+    );
   }
 
-  // Ask for ZIP if they want minimum/fee/ETA but didn’t give one
   if (asksMin || asksFee || asksDelivery) {
-    return `What’s your 5-digit ZIP so I can confirm your delivery window, minimum, and fee? For example: 9-5-8-1-6.`;
+    return "What’s your 5-digit ZIP so I can confirm your delivery window, minimum, and fee? For example: 9-5-8-1-6.";
   }
 
-  // Existing generic intents
-  if (/\bhour|open|close|when\b/.test(q)) return `${HOURS} ${LAST_CALL}`;
+  if (/\bhour|open|close|when\b/.test(q)) return HOURS + " " + LAST_CALL;
   if (/\baddress|location|where|directions|how to get\b/.test(q)) return MAP_URL;
   if (/\bwebsite|site|url|online|menu\b/.test(q))
     return "You can visit us online at Crystal Nugs dot com.";
-  if (/\bid|identification|age|21\b/.test(q)) return `${ID_RULES} ${MED_PTS}`;
+  if (/\bid|identification|age|21\b/.test(q)) return ID_RULES + " " + MED_PTS;
   if (/\bdeliver|delivery|zone|area|minimum|fee|charge\b/.test(q))
-    return `${DELIVERY} ${DELIV_MIN} ${DELIV_FEE}`;
+    return DELIVERY + " " + DELIV_MIN + " " + DELIV_FEE;
   if (/\bparking|park\b/.test(q)) return PARKING;
   if (/\bpay|payment|cash|card|debit|atm|jane ?pay\b/.test(q)) return PAYMENT;
   if (/\bdeal|special|discount|offer|promotion|promo\b/.test(q)) return SPECIALS;
@@ -574,21 +611,28 @@ function handleLocalIntent(q = "") {
 
 // ---------- OpenAI Chat fallback ----------
 async function askOpenAI(userText) {
-  const systemPrompt = `
-You are the Crystal Nugs Sacramento AI voice assistant. Speak in a warm, concierge tone. Keep sentences short. Use natural pauses. Never read raw URLs. Say "Crystal Nugs dot com" instead of a link. If asked for a person, say “No problem, transferring you now.”
-Store hours: ${HOURS}
-Address: ${ADDRESS}
-Website: ${toSpokenText(WEBSITE)}
-Delivery: ${DELIVERY}
-ID rules: ${ID_RULES}
-Payment: ${PAYMENT}
-Returns: ${RETURNS}
-`;
+  const systemPrompt =
+    "You are the Crystal Nugs Sacramento AI voice assistant. Speak in a warm, concierge tone. Keep sentences short. Use natural pauses. Never read raw URLs. Say \"Crystal Nugs dot com\" instead of a link. If asked for a person, say “No problem, transferring you now.” " +
+    "Store hours: " +
+    HOURS +
+    " Address: " +
+    ADDRESS +
+    " Website: " +
+    toSpokenText(WEBSITE) +
+    " Delivery: " +
+    DELIVERY +
+    " ID rules: " +
+    ID_RULES +
+    " Payment: " +
+    PAYMENT +
+    " Returns: " +
+    RETURNS +
+    " ";
 
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      Authorization: "Bearer " + OPENAI_API_KEY,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
@@ -602,14 +646,29 @@ Returns: ${RETURNS}
   });
 
   if (!resp.ok) {
-    const errText = await resp.text().catch(() => "");
+    const errText = await resp.text().catch(function () {
+      return "";
+    });
     throw new Error(
-      `OpenAI ${resp.status} ${resp.statusText}: ${errText.slice(0, 500)}`
+      "OpenAI " +
+        resp.status +
+        " " +
+        resp.statusText +
+        ": " +
+        errText.slice(0, 500)
     );
   }
 
-  const data = await resp.json().catch(() => null);
-  const answer = data?.choices?.[0]?.message?.content?.trim();
+  const data = await resp.json().catch(function () {
+    return null;
+  });
+  const answer =
+    data &&
+    data.choices &&
+    data.choices[0] &&
+    data.choices[0].message &&
+    data.choices[0].message.content &&
+    data.choices[0].message.content.trim();
   return answer || "Sorry, I didn’t catch that.";
 }
 
@@ -618,19 +677,15 @@ function canonicalJaneBase(input) {
   const def = "https://pos.iheartjane.com";
   let u = String(input || "").trim().toLowerCase();
   if (!u) return def;
-  if (u.includes("iheartjane.com") && !u.includes("pos.iheartjane.com"))
+  if (u.indexOf("iheartjane.com") !== -1 && u.indexOf("pos.iheartjane.com") === -1)
     return def;
-  if (!/^https?:\/\//.test(u)) u = `https://${u}`;
+  if (!/^https?:\/\//.test(u)) u = "https://" + u;
   return u.replace(/\/+$/, "");
 }
 
 /**
  * POS v3 Merchant Products endpoint with pagination:
  * GET /api/v3/merchants/{merchant_id}/products?page[size]=N&after_id=ID
- *
- * We IGNORE any search term on the server side and always pull a wide slice,
- * then filter in Node so brands like Maven / Raw Garden / Uncle Larry / STIIIZY
- * aren't missed due to Jane's internal search quirks.
  */
 async function janeMenuSearch(limit = 400, signal) {
   const base = canonicalJaneBase(
@@ -639,30 +694,37 @@ async function janeMenuSearch(limit = 400, signal) {
   const merchantId = process.env.JANE_MERCHANT_ID || "724";
   const token = process.env.JANE_API_TOKEN;
   if (!token || !merchantId) {
-    throw new Error("Missing Jane POS env vars (JANE_API_TOKEN, JANE_MERCHANT_ID)");
+    throw new Error(
+      "Missing Jane POS env vars (JANE_API_TOKEN, JANE_MERCHANT_ID)"
+    );
   }
 
   const maxLimit = Math.max(1, Math.min(Number(limit) || 400, 400));
-  const pageSize = 100; // typical max page size
+  const pageSize = 100;
   const results = [];
   let afterId = null;
   let page = 0;
 
   while (results.length < maxLimit) {
     page += 1;
-    const url = new URL(`/api/v3/merchants/${merchantId}/products`, base);
+    const url = new URL("/api/v3/merchants/" + merchantId + "/products", base);
     url.searchParams.set("page[size]", String(pageSize));
     if (afterId) {
       url.searchParams.set("after_id", String(afterId));
     }
 
     console.log(
-      `Jane fetch page ${page}, after_id=${afterId || "none"}, url=${url.toString()}`
+      "Jane fetch page " +
+        page +
+        ", after_id=" +
+        (afterId || "none") +
+        ", url=" +
+        url.toString()
     );
 
     const resp = await fetch(url.toString(), {
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: "Bearer " + token,
         Accept: "application/json",
         "User-Agent": "CrystalNugs-VoiceBot/1.0",
       },
@@ -670,7 +732,9 @@ async function janeMenuSearch(limit = 400, signal) {
     });
 
     if (!resp.ok) {
-      const text = await resp.text().catch(() => "");
+      const text = await resp.text().catch(function () {
+        return "";
+      });
       if (resp.status === 401) {
         throw new Error("Jane 401: Invalid API token for POS v3.");
       }
@@ -679,25 +743,26 @@ async function janeMenuSearch(limit = 400, signal) {
           "Jane API blocked (403). Ask your Jane rep to allowlist your server IP and confirm POS API scopes."
         );
       }
-      throw new Error(`Jane ${resp.status}: ${text.slice(0, 300)}`);
+      throw new Error("Jane " + resp.status + ": " + text.slice(0, 300));
     }
 
-    const data = await resp.json().catch(() => null);
-    let items = Array.isArray(data) ? data : data?.data || data?.items || [];
+    const data = await resp.json().catch(function () {
+      return null;
+    });
+    let items = Array.isArray(data) ? data : (data && data.data) || data?.items || [];
 
     if (!Array.isArray(items) || !items.length) {
-      break; // no more pages
+      break;
     }
 
-    results.push(...items);
+    results.push.apply(results, items);
 
-    // figure out the next after_id
     const last = items[items.length - 1];
-    const nextId = last?.id ?? last?.product_id ?? null;
+    const nextId = (last && last.id) || last?.product_id || null;
     if (!nextId) break;
     afterId = nextId;
 
-    if (items.length < pageSize) break; // last partial page
+    if (items.length < pageSize) break;
   }
 
   console.log("Jane total fetched products:", results.length);
@@ -705,8 +770,6 @@ async function janeMenuSearch(limit = 400, signal) {
 }
 
 // ---------- Inventory + brand/category detection ----------
-
-// Very light detector — focuses on brand + “carry/have/stock/sell” + optional category
 function detectProductQuery(text = "") {
   const raw = String(text || "");
   const t = raw.toLowerCase();
@@ -716,19 +779,25 @@ function detectProductQuery(text = "") {
       t
     );
 
-  // Category detection
   let category = null;
   if (/\b(flower|eighth|3\.5g|7g|14g|ounce|oz|pre[-\s]?pack)\b/.test(t)) {
     category = "flower";
-  } else if (/\b(vape|vapes|cart|carts|cartridge|cartridges|pod|pods|disposable)\b/.test(t)) {
+  } else if (
+    /\b(vape|vapes|cart|carts|cartridge|cartridges|pod|pods|disposable)\b/.test(
+      t
+    )
+  ) {
     category = "vape";
-  } else if (/\b(pre[\s-]?rolls?|joints?|infused pre[\s-]?rolls?)\b/.test(t)) {
+  } else if (
+    /\b(pre[\s-]?rolls?|joints?|infused pre[\s-]?rolls?)\b/.test(t)
+  ) {
     category = "pre-roll";
-  } else if (/\b(edible|edibles|gummy|gummies|chocolate|cookie|drink|beverage)\b/.test(t)) {
+  } else if (
+    /\b(edible|edibles|gummy|gummies|chocolate|cookie|drink|beverage)\b/.test(t)
+  ) {
     category = "edible";
   }
 
-  // Normalize some brand spellings
   let normalized = t
     .replace(/\bsteezy\b/g, "stiiizy")
     .replace(/\bstizzy\b/g, "stiiizy");
@@ -740,12 +809,12 @@ function detectProductQuery(text = "") {
     { re: /\buncle\s+larry'?s?\b/i, brand: "Uncle Larry" },
   ];
 
-  for (const { re, brand } of brandMap) {
-    const m = normalized.match(re);
+  for (let i = 0; i < brandMap.length; i++) {
+    const m = normalized.match(brandMap[i].re);
     if (m && (askedCarry || category || /\bany\b/.test(t))) {
       return {
-        brand,
-        category,
+        brand: brandMap[i].brand,
+        category: category,
         keyword: null,
         rawBrandToken: m[0],
         rawText: raw,
@@ -753,19 +822,17 @@ function detectProductQuery(text = "") {
     }
   }
 
-  // Generic pattern: "do you carry X", "do you have X", "you got X"
   const genericBrandMatch =
     normalized.match(
       /\b(?:do you (?:guys )?(?:carry|have|stock|sell)|y['’]?all(?: got| have)?|you got)\s+([a-z0-9 '&-]+)\b/
-    ) ||
-    normalized.match(/\bcarry\s+([a-z0-9 '&-]+)\b/);
+    ) || normalized.match(/\bcarry\s+([a-z0-9 '&-]+)\b/);
 
   if (genericBrandMatch) {
     const candidate = genericBrandMatch[1].trim();
     if (candidate && candidate.length > 1) {
       return {
         brand: capitalizeWords(candidate),
-        category,
+        category: category,
         keyword: null,
         rawBrandToken: candidate,
         rawText: raw,
@@ -773,9 +840,8 @@ function detectProductQuery(text = "") {
     }
   }
 
-  // Old "Gelato pre-rolls" style (strain / keyword without brand)
   if ((askedCarry || category) && /\b(gelato|zkittlez|blueberry|infused)\b/i.test(normalized)) {
-    const term = normalized.match(/\b(gelato|zkittlez|blueberry|infused)\b/i)?.[0];
+    const term = normalized.match(/\b(gelato|zkittlez|blueberry|infused)\b/i)[0];
     return {
       brand: null,
       category: category || "pre-roll",
@@ -788,14 +854,23 @@ function detectProductQuery(text = "") {
   return null;
 }
 
-// When live lookups are off
 function inventoryLookupDisabledLine(intent) {
   const label = intent.brand || intent.keyword || "that brand";
   if (intent.category) {
     const catLabel = humanCategory(intent.category);
-    return `I can’t check live inventory right now, but you can see all ${label} ${catLabel} on our menu at Crystal Nugs dot com.`;
+    return (
+      "I can’t check live inventory right now, but you can see all " +
+      label +
+      " " +
+      catLabel +
+      " on our menu at Crystal Nugs dot com."
+    );
   }
-  return `I can’t check live inventory right now, but you can see all ${label} items on our menu at Crystal Nugs dot com.`;
+  return (
+    "I can’t check live inventory right now, but you can see all " +
+    label +
+    " items on our menu at Crystal Nugs dot com."
+  );
 }
 
 function humanCategory(cat) {
@@ -817,26 +892,27 @@ function capitalizeWords(str = "") {
   return String(str)
     .trim()
     .split(/\s+/)
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .map(function (w) {
+      return w.charAt(0).toUpperCase() + w.slice(1);
+    })
     .join(" ");
 }
 
 // Try to extract a brand name from a Jane item.
-// Prefer explicit brand fields, but fall back to the prefix of the product name before the first "-".
 function extractItemBrand(it = {}) {
   const explicit =
-    it?.brand?.name ||
-    it?.brand_name ||
-    it?.brand ||
+    (it &&
+      (it.brand && it.brand.name
+        ? it.brand.name
+        : it.brand_name || it.brand)) ||
     "";
 
   let brand = String(explicit).trim();
   if (brand) return brand;
 
-  const name = (it?.name || it?.product_name || "").toString().trim();
+  const name = ((it && (it.name || it.product_name)) || "").toString().trim();
   if (!name) return "";
 
-  // Pattern: "STIIIZY - Orange Sunset All In One - [1g] Sativa"
   const m = name.match(/^([A-Za-z0-9.'&\s]+?)\s*-\s+/);
   if (m && m[1]) {
     return m[1].trim();
@@ -845,19 +921,26 @@ function extractItemBrand(it = {}) {
   return "";
 }
 
-// *** FIXED: don't treat missing/0 prices as $0 ***
+// *** Don't treat missing/0 prices as $0 ***
 function extractJanePriceCents(item = {}) {
   const direct =
-    item?.price?.price ??
-    item?.price ??
-    item?.variants?.[0]?.price?.price ??
-    item?.variants?.[0]?.price ??
+    (item &&
+      item.price &&
+      typeof item.price.price !== "undefined" &&
+      item.price.price) ||
+    item.price ||
+    (item &&
+      item.variants &&
+      item.variants[0] &&
+      (typeof item.variants[0].price.price !== "undefined"
+        ? item.variants[0].price.price
+        : item.variants[0].price)) ||
     null;
 
   if (direct == null) return null;
 
   const n = Number(direct);
-  if (!Number.isFinite(n) || n <= 0) {
+  if (!isFinite(n) || n <= 0) {
     return null;
   }
 
@@ -867,44 +950,44 @@ function extractJanePriceCents(item = {}) {
 function filterJaneItemsByIntent(items = [], intent) {
   let list = Array.isArray(items) ? items.slice() : [];
 
-  // Brand filter
+  // Brand filter — now looks in brand fields AND product name text
   if (intent.brand) {
     const needle = intent.brand.toLowerCase();
-    list = list.filter((it) => {
-      const b = extractItemBrand(it).toString().trim().toLowerCase();
-      if (!b) return false;
-
-      if (b === needle) return true;
-      if (b.includes(needle)) return true;
-
-      return false;
+    list = list.filter(function (it) {
+      const brandText = extractItemBrand(it);
+      const nameText = ((it && (it.name || it.product_name)) || "").toString();
+      const combined = (brandText + " " + nameText).toLowerCase();
+      if (!combined) return false;
+      return combined.indexOf(needle) !== -1;
     });
   }
 
-  // Keyword/strain filter (if used)
   if (intent.keyword) {
     const k = intent.keyword.toLowerCase();
-    list = list.filter((it) => {
-      const name = (it?.name || it?.product_name || "").toLowerCase();
-      const strain = (it?.strain || it?.strain_name || "").toLowerCase();
-      return name.includes(k) || strain.includes(k);
+    list = list.filter(function (it) {
+      const name = ((it && (it.name || it.product_name)) || "")
+        .toString()
+        .toLowerCase();
+      const strain = ((it && (it.strain || it.strain_name)) || "")
+        .toString()
+        .toLowerCase();
+      return name.indexOf(k) !== -1 || strain.indexOf(k) !== -1;
     });
   }
 
-  // Category filter
   if (intent.category) {
     const c = intent.category;
-    list = list.filter((it) => {
+    list = list.filter(function (it) {
       const blob = (
-        (it?.category || "") +
+        ((it && it.category) || "") +
         " " +
-        (it?.product_category || "") +
+        ((it && it.product_category) || "") +
         " " +
-        (it?.sub_category || "") +
+        ((it && it.sub_category) || "") +
         " " +
-        (it?.type || "") +
+        ((it && it.type) || "") +
         " " +
-        (it?.leaf_category || "")
+        ((it && it.leaf_category) || "")
       )
         .toString()
         .toLowerCase();
@@ -951,12 +1034,10 @@ function filterJaneItemsByIntent(items = [], intent) {
 
 function collectStrainCount(items = []) {
   const set = new Set();
-  for (const it of items) {
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
     const rawName =
-      (it?.strain ||
-        it?.strain_name ||
-        it?.name ||
-        it?.product_name ||
+      ((it && (it.strain || it.strain_name || it.name || it.product_name)) ||
         "") + "";
     const cleaned = rawName
       .replace(
@@ -972,12 +1053,18 @@ function collectStrainCount(items = []) {
 
 function formatPriceRangeFromItems(items = []) {
   const prices = items
-    .map((it) => extractJanePriceCents(it))
-    .filter((v) => typeof v === "number");
+    .map(function (it) {
+      return extractJanePriceCents(it);
+    })
+    .filter(function (v) {
+      return typeof v === "number";
+    });
 
   if (!prices.length) return "";
 
-  prices.sort((a, b) => a - b);
+  prices.sort(function (a, b) {
+    return a - b;
+  });
   const low = prices[0] / 100;
   const high = prices[prices.length - 1] / 100;
 
@@ -985,17 +1072,17 @@ function formatPriceRangeFromItems(items = []) {
   const highStr = high.toFixed(2).replace(/\.00$/, "");
 
   if (low === high) {
-    return ` Prices are about $${lowStr} before tax.`;
+    return " Prices are about $" + lowStr + " before tax.";
   }
-  return ` Prices start around $${lowStr} and go up to about $${highStr} before tax.`;
+  return (
+    " Prices start around $" +
+    lowStr +
+    " and go up to about $" +
+    highStr +
+    " before tax."
+  );
 }
 
-/**
- * Turn Jane data + parsed intent into a spoken summary:
- * - honest yes/no (no hard-coded “we carry it”)
- * - # of strains/options
- * - price range from cheapest
- */
 function summarizeBrandInventory(intent, rawItems = []) {
   const brandLabel = intent.brand || intent.keyword || "that brand";
   const allItems = Array.isArray(rawItems) ? rawItems : [];
@@ -1004,35 +1091,14 @@ function summarizeBrandInventory(intent, rawItems = []) {
   console.log("User intent:", intent);
   console.log("Total items returned from Jane:", allItems.length);
 
-  // ----- STEP 1: Build a set of known brand names from Jane (including name prefixes like STIIIZY - ...) -----
-  const knownBrands = new Set();
-  for (const it of allItems) {
-    const b = extractItemBrand(it)
-      .toString()
-      .trim()
-      .toLowerCase();
-    if (b) knownBrands.add(b);
-  }
-
-  // If they asked for a brand, but that brand name is not in Jane at all,
-  // do NOT say we have it. Be honest.
-  if (intent.brand) {
-    const wanted = intent.brand.toString().trim().toLowerCase();
-    const hasExactBrand = knownBrands.has(wanted);
-
-    if (!hasExactBrand) {
-      if (!allItems.length) {
-        return `I’m not seeing any items come back from our menu system right now. It might be updating. Please check Crystal Nugs dot com for the live menu or ask a budtender.`;
-      }
-
-      return `I’m not seeing ${brandLabel} in our live menu data right now. It might be sold out or not something we carry at the moment. Please double check on Crystal Nugs dot com or with a budtender for the most accurate info.`;
-    }
-  }
-
-  // ----- STEP 2: Normal filtering for brand + category -----
-  const brandOnly = filterJaneItemsByIntent(allItems, { ...intent, category: null });
+  // Filter by brand only (no category)
+  const brandOnly = filterJaneItemsByIntent(allItems, {
+    ...intent,
+    category: null,
+  });
   console.log("Items for brand-only filter:", brandOnly.length);
 
+  // Filter by brand + category (if category specified)
   const matched = filterJaneItemsByIntent(allItems, intent);
   console.log("Items after brand + category filter:", matched.length);
 
@@ -1040,24 +1106,46 @@ function summarizeBrandInventory(intent, rawItems = []) {
     ? brandOnly.length > 0
     : matched.length > 0;
 
-  // No items for brand/category (but brand DOES exist in Jane)
-  if (!hasAnyBrandItems) {
-    if (!allItems.length) {
-      return `I’m not seeing any items come back from our menu system right now. It might be updating. Please check Crystal Nugs dot com for the live menu or ask a budtender.`;
-    }
-
-    return `I’m not seeing ${brandLabel} in that category in our live menu data right now. It might be sold out at the moment. Please double check on Crystal Nugs dot com or with a budtender for the most accurate info.`;
+  // If Jane returned absolutely nothing, don't guess
+  if (!allItems.length) {
+    return "I’m not seeing any items come back from our menu system right now. It might be updating. Please check Crystal Nugs dot com for the live menu or ask a budtender.";
   }
 
-  // If they asked for a category but our category filter wiped everything out,
-  // fall back to brand-only so we don't claim zero.
+  // If we have a brand in the question but brand-only is empty:
+  if (intent.brand && brandOnly.length === 0) {
+    return (
+      "I’m not seeing " +
+      brandLabel +
+      " in our live menu data right now. It might be sold out or not something we carry at the moment. Please double check on Crystal Nugs dot com or with a budtender for the most accurate info."
+    );
+  }
+
+  // If no brand in question and no matches at all:
+  if (!intent.brand && !hasAnyBrandItems) {
+    return (
+      "I’m not seeing that in our live menu data right now. It might be sold out or not something we carry at the moment. Please double check on Crystal Nugs dot com or with a budtender for the most accurate info."
+    );
+  }
+
+  // Category requested but category-filtered list is empty → brand exists, but not that category
+  if (intent.category && brandOnly.length > 0 && matched.length === 0) {
+    const catLabel = humanCategory(intent.category);
+    return (
+      "I’m not seeing " +
+      brandLabel +
+      " " +
+      catLabel +
+      " in our live menu data right now. It might be sold out at the moment. Please double check on Crystal Nugs dot com or with a budtender for the most accurate info."
+    );
+  }
+
+  // Choose working list: category matches when available, else brand-only
   let workingList;
-  if (intent.category && matched.length === 0) {
-    console.log("Category filter too strict; falling back to brand-only results.");
+  if (intent.category && matched.length > 0) {
+    workingList = matched;
+  } else if (brandOnly.length > 0) {
     workingList = brandOnly;
-  } else if (brandOnly.length) {
-    workingList = intent.category ? matched : brandOnly;
-  } else if (matched.length) {
+  } else if (matched.length > 0) {
     workingList = matched;
   } else {
     workingList = allItems;
@@ -1069,14 +1157,26 @@ function summarizeBrandInventory(intent, rawItems = []) {
 
   let countPhrase;
   if (strainCount <= 10) {
-    countPhrase = `about ${strainCount}`;
+    countPhrase = "about " + strainCount;
   } else if (strainCount <= 25) {
-    countPhrase = `over 10`;
+    countPhrase = "over 10";
   } else {
-    countPhrase = `over 20`;
+    countPhrase = "over 20";
   }
 
-  return `Yes — we have ${countPhrase} ${catLabel} from ${brandLabel} in stock.${priceLine} For exact strains and live inventory, go to Crystal Nugs dot com and search for ${brandLabel}.`;
+  return (
+    "Yes — we have " +
+    countPhrase +
+    " " +
+    catLabel +
+    " from " +
+    brandLabel +
+    " in stock." +
+    priceLine +
+    " For exact strains and live inventory, go to Crystal Nugs dot com and search for " +
+    brandLabel +
+    "."
+  );
 }
 
 // ---------- Utils ----------
@@ -1097,32 +1197,29 @@ function escapeXml(str = "") {
     .replace(/>/g, "&gt;");
 }
 
-/** Speak ZIP as hyphenated digits: "95827" -> "9-5-8-2-7" */
 function speakZip(zip = "") {
   const z = String(zip).replace(/[^\d]/g, "").slice(0, 5);
   return z.split("").join("-");
 }
 
-/** Extract first 5-digit ZIP from text */
 function extractZip(text = "") {
   const m = String(text).match(/\b\d{5}\b/);
   return m ? m[0] : null;
 }
 
-/** Lookup delivery record by ZIP */
 function deliveryByZip(zip) {
-  return DELIVERY_TABLE.find((r) => r.zip === zip) || null;
+  return DELIVERY_TABLE.find(function (r) {
+    return r.zip === zip;
+  }) || null;
 }
 
-/** Format money; 40 -> $40, 1.99 -> $1.99 */
 function formatMoney(n) {
   const num = Number(n);
   if (Number.isNaN(num)) return String(n);
   const s = num.toFixed(2);
-  return s.endsWith(".00") ? `$${parseInt(s, 10)}` : `$${s}`;
+  return s.endsWith(".00") ? "$" + parseInt(s, 10) : "$" + s;
 }
 
-/** Compute ETA window if not set, based on minimum (heuristic) */
 function computeEtaWindow(minimum) {
   const m = Number(minimum) || 0;
   if (m <= 40) return "30–60 minutes";
@@ -1133,7 +1230,6 @@ function computeEtaWindow(minimum) {
   return "120–240 minutes";
 }
 
-/** Convert crystalnugs.com + emails to friendly spoken phrases */
 function toSpokenText(text = "") {
   if (!text) return "";
   let out = String(text);
@@ -1145,14 +1241,17 @@ function toSpokenText(text = "") {
   out = out.replace(/\bcrystalnugs\.com\b/gi, "Crystal Nugs dot com");
   out = out.replace(
     /\b([a-z0-9._%+-]+)@crystalnugs\.com\b/gi,
-    (_m, user) => `${user} at crystal nugs dot com`
+    function (_m, user) {
+      return user + " at crystal nugs dot com";
+    }
   );
   out = out.replace(/https?:\/\//gi, "");
   return out;
 }
 
-/** Venue label helper for natural phrasing */
-function venueLabel({ mentionsHotel, mentionsVenue }) {
+function venueLabel(opts) {
+  const mentionsHotel = opts.mentionsHotel;
+  const mentionsVenue = opts.mentionsVenue;
   if (mentionsHotel && mentionsVenue)
     return "hotels, motels, restaurants, bars, and truck stops";
   if (mentionsHotel) return "hotels and motels";
@@ -1163,7 +1262,6 @@ function venueLabel({ mentionsHotel, mentionsVenue }) {
 function brandVoice(raw = "") {
   const cleaned = toSpokenText(raw).trim();
 
-  // Plain text mode (no SSML)
   if (!USE_SSML) {
     return cleaned
       .replace(/\s+/g, " ")
@@ -1174,27 +1272,34 @@ function brandVoice(raw = "") {
       .replace(/\s{2,}/g, " ");
   }
 
-  // SSML mode
   const parts = cleaned
     .split(/(?<=[\.\?!])\s+/)
-    .map(function (s) { return s.trim(); })
-    .filter(function (s) { return s.length > 0; });
+    .map(function (s) {
+      return s.trim();
+    })
+    .filter(function (s) {
+      return s.length > 0;
+    });
 
   const ssmlBody = parts
-    .map(function (s) { return emphasisLead(s, 3); })
+    .map(function (s) {
+      return emphasisLead(s, 3);
+    })
     .join('<break time="240ms"/>');
 
   return (
-    '<speak>' +
-      '<prosody rate="fast" pitch="+8%" volume="medium">' +
-        ssmlBody +
-      '</prosody>' +
-    '</speak>'
+    "<speak>" +
+    '<prosody rate="fast" pitch="+8%" volume="medium">' +
+    ssmlBody +
+    "</prosody>" +
+    "</speak>"
   );
 }
 
 function emphasisLead(sentence = "", n = 3) {
-  const tokens = sentence.split(/\s+/).filter(function (t) { return t; });
+  const tokens = sentence.split(/\s+/).filter(function (t) {
+    return t;
+  });
   const lead = tokens.slice(0, n).join(" ");
   const tail = tokens.slice(n).join(" ");
 
@@ -1203,18 +1308,11 @@ function emphasisLead(sentence = "", n = 3) {
 
   if (tailEsc) {
     return (
-      '<emphasis level="moderate">' +
-        leadEsc +
-      '</emphasis> ' +
-      tailEsc
+      '<emphasis level="moderate">' + leadEsc + "</emphasis> " + tailEsc
     );
   }
 
-  return (
-    '<emphasis level="moderate">' +
-      leadEsc +
-    '</emphasis>'
-  );
+  return '<emphasis level="moderate">' + leadEsc + "</emphasis>";
 }
 
 function escapeSSML(str = "") {
