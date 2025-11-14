@@ -18,7 +18,8 @@ app.use(bodyParser.json());
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini";
-const USE_SSML = String(process.env.CN_USE_SSML || "false").toLowerCase() === "true";
+const USE_SSML =
+  String(process.env.CN_USE_SSML || "false").toLowerCase() === "true";
 
 // Prefer explicit transfer env; fall back to old variable; final fallback is store line.
 const TRANSFER_NUMBER =
@@ -613,14 +614,6 @@ Returns: ${RETURNS}
 }
 
 // ---------- Jane POS helpers ----------
-function moneyFromCents(cents) {
-  const n = Number(cents);
-  if (Number.isNaN(n)) return "priced on the menu";
-  const s = (n / 100).toFixed(2);
-  return `$${s.replace(/\.00$/, "")}`;
-}
-
-// Base URL helper: force POS host
 function canonicalJaneBase(input) {
   const def = "https://pos.iheartjane.com";
   let u = String(input || "").trim().toLowerCase();
@@ -636,7 +629,7 @@ function canonicalJaneBase(input) {
  * GET /api/v3/merchants/{merchant_id}/products?page[size]=N&after_id=ID
  *
  * We IGNORE any search term on the server side and always pull a wide slice,
- * then filter in Node so brands like Maven / Raw Garden / Uncle Larry
+ * then filter in Node so brands like Maven / Raw Garden / Uncle Larry / STIIIZY
  * aren't missed due to Jane's internal search quirks.
  */
 async function janeMenuSearch(limit = 400, signal) {
@@ -712,15 +705,6 @@ async function janeMenuSearch(limit = 400, signal) {
 }
 
 // ---------- Inventory + brand/category detection ----------
-
-const CORE_ALWAYS_BRANDS = [
-  "Maven",
-  "Maven Genetics",
-  "STIIIZY",
-  "Raw Garden",
-  "Uncle Larry",
-  "Uncle Larry's",
-];
 
 // Very light detector — focuses on brand + “carry/have/stock/sell” + optional category
 function detectProductQuery(text = "") {
@@ -837,6 +821,30 @@ function capitalizeWords(str = "") {
     .join(" ");
 }
 
+// Try to extract a brand name from a Jane item.
+// Prefer explicit brand fields, but fall back to the prefix of the product name before the first "-".
+function extractItemBrand(it = {}) {
+  const explicit =
+    it?.brand?.name ||
+    it?.brand_name ||
+    it?.brand ||
+    "";
+
+  let brand = String(explicit).trim();
+  if (brand) return brand;
+
+  const name = (it?.name || it?.product_name || "").toString().trim();
+  if (!name) return "";
+
+  // Pattern: "STIIIZY - Orange Sunset All In One - [1g] Sativa"
+  const m = name.match(/^([A-Za-z0-9.'&\s]+?)\s*-\s+/);
+  if (m && m[1]) {
+    return m[1].trim();
+  }
+
+  return "";
+}
+
 // *** FIXED: don't treat missing/0 prices as $0 ***
 function extractJanePriceCents(item = {}) {
   const direct =
@@ -863,9 +871,13 @@ function filterJaneItemsByIntent(items = [], intent) {
   if (intent.brand) {
     const needle = intent.brand.toLowerCase();
     list = list.filter((it) => {
-      const brand =
-        (it?.brand?.name || it?.brand_name || it?.brand || "").toLowerCase();
-      return brand.includes(needle);
+      const b = extractItemBrand(it).toString().trim().toLowerCase();
+      if (!b) return false;
+
+      if (b === needle) return true;
+      if (b.includes(needle)) return true;
+
+      return false;
     });
   }
 
@@ -978,35 +990,9 @@ function formatPriceRangeFromItems(items = []) {
   return ` Prices start around $${lowStr} and go up to about $${highStr} before tax.`;
 }
 
-function detectAvailableCategories(items = []) {
-  const cats = new Set();
-  for (const it of items) {
-    const blob = (
-      (it?.category || "") +
-      " " +
-      (it?.product_category || "") +
-      " " +
-      (it?.sub_category || "") +
-      " " +
-      (it?.type || "") +
-      " " +
-      (it?.leaf_category || "")
-    )
-      .toString()
-      .toLowerCase();
-
-    if (/\bflower\b/.test(blob)) cats.add("flower");
-    if (/\b(vape|cartridge|cart|pod|disposable)\b/.test(blob)) cats.add("vape");
-    if (/\b(pre[-\s]?roll|joint)\b/.test(blob)) cats.add("pre-roll");
-    if (/\b(edible|gumm(y|ies)|chocolate|cookie|drink|beverage)\b/.test(blob))
-      cats.add("edible");
-  }
-  return Array.from(cats);
-}
-
 /**
  * Turn Jane data + parsed intent into a spoken summary:
- * - honest yes/no (with special handling for core brands)
+ * - honest yes/no (no hard-coded “we carry it”)
  * - # of strains/options
  * - price range from cheapest
  */
@@ -1018,6 +1004,32 @@ function summarizeBrandInventory(intent, rawItems = []) {
   console.log("User intent:", intent);
   console.log("Total items returned from Jane:", allItems.length);
 
+  // ----- STEP 1: Build a set of known brand names from Jane (including name prefixes like STIIIZY - ...) -----
+  const knownBrands = new Set();
+  for (const it of allItems) {
+    const b = extractItemBrand(it)
+      .toString()
+      .trim()
+      .toLowerCase();
+    if (b) knownBrands.add(b);
+  }
+
+  // If they asked for a brand, but that brand name is not in Jane at all,
+  // do NOT say we have it. Be honest.
+  if (intent.brand) {
+    const wanted = intent.brand.toString().trim().toLowerCase();
+    const hasExactBrand = knownBrands.has(wanted);
+
+    if (!hasExactBrand) {
+      if (!allItems.length) {
+        return `I’m not seeing any items come back from our menu system right now. It might be updating. Please check Crystal Nugs dot com for the live menu or ask a budtender.`;
+      }
+
+      return `I’m not seeing ${brandLabel} in our live menu data right now. It might be sold out or not something we carry at the moment. Please double check on Crystal Nugs dot com or with a budtender for the most accurate info.`;
+    }
+  }
+
+  // ----- STEP 2: Normal filtering for brand + category -----
   const brandOnly = filterJaneItemsByIntent(allItems, { ...intent, category: null });
   console.log("Items for brand-only filter:", brandOnly.length);
 
@@ -1028,33 +1040,17 @@ function summarizeBrandInventory(intent, rawItems = []) {
     ? brandOnly.length > 0
     : matched.length > 0;
 
-  const isCoreBrand =
-    intent.brand &&
-    CORE_ALWAYS_BRANDS.some(
-      (b) => b.toLowerCase() === intent.brand.toLowerCase()
-    );
-
-  // No items at all for that brand/keyword
+  // No items for brand/category (but brand DOES exist in Jane)
   if (!hasAnyBrandItems) {
-    if (isCoreBrand) {
-      // You know you carry this, even if Jane didn't return it in this slice
-      if (intent.category) {
-        const catLabel = humanCategory(intent.category);
-        return `We do carry ${brandLabel} ${catLabel}, but I’m not seeing them in our live menu data at this moment. Inventory updates often. For exact options and pricing, please check Crystal Nugs dot com or ask a budtender in-store.`;
-      }
-      return `We do carry ${brandLabel}, but I’m not seeing it in our live menu snapshot right now. Inventory updates often. For exact options and pricing, please check Crystal Nugs dot com or ask a budtender in-store.`;
-    }
-
-    // Non-core brands: be honest about not finding them
     if (!allItems.length) {
       return `I’m not seeing any items come back from our menu system right now. It might be updating. Please check Crystal Nugs dot com for the live menu or ask a budtender.`;
     }
 
-    return `I’m not seeing a clear match for ${brandLabel} in our menu data right now, but inventory can change fast. Please double check on Crystal Nugs dot com or with a budtender for the most accurate info.`;
+    return `I’m not seeing ${brandLabel} in that category in our live menu data right now. It might be sold out at the moment. Please double check on Crystal Nugs dot com or with a budtender for the most accurate info.`;
   }
 
   // If they asked for a category but our category filter wiped everything out,
-  // fall back to brand-only so we don't lie and say you have zero.
+  // fall back to brand-only so we don't claim zero.
   let workingList;
   if (intent.category && matched.length === 0) {
     console.log("Category filter too strict; falling back to brand-only results.");
@@ -1198,7 +1194,7 @@ function emphasisLead(sentence = "", n = 3) {
   const leadEsc = escapeSSML(lead);
   const tailEsc = escapeSSML(tail);
   return tail
-    ? `<emphasis level="moderate">${leadEsc}</emphasis> ${tailEsc}`
+    ? `<emphasis level="moderate">${leadEsc}</emphasis> ${tailEsc>`
     : `<emphasis level="moderate">${leadEsc}</emphasis>`;
 }
 
