@@ -89,7 +89,7 @@ const ID_RULES =
 
 const DELIVERY =
   process.env.CN_DELIVERY ||
-  "We deliver to Midtown and the greater Sacramento area including Citrus Heights, Roseville, Lincoln, Folsom, Elk Grove, and more. Share your address to confirm delivery.";
+  "We deliver to Midtown and the greater Sacramento area including Citrus Heights, Roseville, Lincoln, Folsom, Elk Grove, and much more. Share your zip code to confirm delivery.";
 
 const DELIV_MIN =
   process.env.CN_DELIVERY_MINIMUM ||
@@ -277,7 +277,7 @@ app.get("/jane/test", async (_req, res) => {
 app.post("/twilio/voice", (req, res) => {
   const wsUrl = `wss://${req.get("host")}/relay`;
   const greeting =
-    "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, our address, frequently asked questions, or delivery order lookups. What can I do for you today?";
+    "Welcome to Crystal Nugs Sacramento. I can help with delivery areas, store hours, address, frequently asked questions, or product lookups. What can I do for you today?";
 
   const twiml =
     `<Response>
